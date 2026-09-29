@@ -54,6 +54,7 @@ export const deployment = Object.freeze((() => {
   const apiUrl = cleanUrl(process.env.API_URL, tenancyMode === 'single' ? appUrl : `https://api.${rootDomain}`)
   const portalUrl = cleanUrl(process.env.PORTAL_URL, tenancyMode === 'single' ? `${appUrl}/portal` : '')
   const rmmUrl = cleanUrl(process.env.RMM_URL, tenancyMode === 'single' ? `${appUrl}/rmm` : '')
+  const adminUrl = cleanUrl(process.env.ADMIN_URL, `https://admin.${rootDomain}`)
 
   return {
     deploymentMode,
@@ -65,6 +66,7 @@ export const deployment = Object.freeze((() => {
     apiUrl,
     portalUrl,
     rmmUrl,
+    adminUrl,
     cookieDomain: String(process.env.COOKIE_DOMAIN ?? (tenancyMode === 'multi' ? `.${rootDomain}` : '')).trim(),
   }
 })())
@@ -95,6 +97,7 @@ export function allowedRequestOrigin(origin) {
     originOf(deployment.apiUrl),
     originOf(deployment.portalUrl),
     originOf(deployment.rmmUrl),
+    originOf(deployment.adminUrl),
   ].filter(Boolean))
 
   if (explicit.has(normalized)) return origin
