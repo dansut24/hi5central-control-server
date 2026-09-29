@@ -286,5 +286,7 @@ export function registerNotificationRoutes(app) {
     return c.json({ settings })
   })
 
-  startDeliveryWorker()
+  if (!['0', 'false', 'off', 'no'].includes(String(process.env.BACKGROUND_WORKERS_ENABLED || 'true').trim().toLowerCase())) {
+    startDeliveryWorker()
+  }
 }
