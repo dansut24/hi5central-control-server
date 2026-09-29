@@ -22,6 +22,14 @@ const DEFAULT_PREFERENCES = Object.freeze({
     security: true,
     platform: true,
   },
+  requesterEvents: {
+    customerUpdates: true,
+    statusChanges: true,
+    recordCreated: true,
+    approvals: true,
+    taskUpdates: false,
+    systemUpdates: false,
+  },
 })
 
 let workerStarted = false
@@ -39,7 +47,9 @@ function normalisePreferences(input = {}, fallback = DEFAULT_PREFERENCES) {
   const data = object(input)
   const channels = object(data.channels)
   const categories = object(data.categories)
+  const requesterEvents = object(data.requesterEvents)
   const baseCategories = fallback.categories || DEFAULT_PREFERENCES.categories
+  const baseRequesterEvents = fallback.requesterEvents || DEFAULT_PREFERENCES.requesterEvents
   return {
     channels: {
       inApp: boolean(channels.inApp, fallback.channels.inApp),
@@ -48,6 +58,9 @@ function normalisePreferences(input = {}, fallback = DEFAULT_PREFERENCES) {
     },
     categories: Object.fromEntries(
       Object.keys(DEFAULT_PREFERENCES.categories).map((key) => [key, boolean(categories[key], baseCategories[key])]),
+    ),
+    requesterEvents: Object.fromEntries(
+      Object.keys(DEFAULT_PREFERENCES.requesterEvents).map((key) => [key, boolean(requesterEvents[key], baseRequesterEvents[key])]),
     ),
   }
 }
@@ -79,6 +92,23 @@ function categoryForEvent(eventType = '') {
 function eventEnabled(preferences, eventType) {
   const category = categoryForEvent(eventType)
   return preferences.categories[category] !== false
+}
+
+function requesterEventClass(eventType = '') {
+  const value = String(eventType).toLowerCase()
+  if (value.includes('customer_update')) return 'customerUpdates'
+  if (value.includes('approval')) return 'approvals'
+  if (value.includes('.task_') || value.includes('.task.')) return 'taskUpdates'
+  if (value.endsWith('.created') || value.includes('.submitted')) return 'recordCreated'
+  if (value.includes('status_changed') || value.includes('transitioned')) return 'statusChanges'
+  return 'systemUpdates'
+}
+
+function recipientEventEnabled(preferences, eventType, tenantRole = '') {
+  if (!eventEnabled(preferences, eventType)) return false
+  if (tenantRole !== 'requester') return true
+  const key = requesterEventClass(eventType)
+  return preferences.requesterEvents?.[key] !== false
 }
 
 function originMatchesSession(c, session) {
@@ -143,7 +173,7 @@ async function processEmailDeliveries() {
 
     for (const row of result.rows) {
       const preferences = await userPreferences(row.tenant_id, row.user_id)
-      if (!preferences.channels.email || !eventEnabled(preferences, row.event_type)) {
+      if (!preferences.channels.email || !recipientEventEnabled(preferences, row.event_type, row.tenant_role)) {
         await pool.query(`UPDATE notification_deliveries SET status='suppressed',updated_at=now() WHERE id=$1`, [row.delivery_id])
         continue
       }
@@ -192,7 +222,7 @@ export function registerNotificationRoutes(app) {
        FROM platform_notifications WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT $3`,
       [auth.session.tenant_id, auth.session.user_id, limit],
     )
-    const items = preferences.channels.inApp ? result.rows.filter((row) => eventEnabled(preferences, row.event_type)).map((row) => ({
+    const items = preferences.channels.inApp ? result.rows.filter((row) => recipientEventEnabled(preferences, row.event_type, auth.session.tenant_role)).map((row) => ({
       id: row.id, eventType: row.event_type, category: categoryForEvent(row.event_type), title: row.title, body: row.body,
       target: { type: row.target_type, reference: row.target_reference }, metadata: row.metadata || {}, read: Boolean(row.read_at), readAt: row.read_at, createdAt: row.created_at,
     })) : []

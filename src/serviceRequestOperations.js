@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
@@ -118,11 +119,28 @@ async function resolvePerson(db, tenantId, value) {
 function safeAttachments(value, visibility) {
   return asArray(value).slice(0, 20).map((attachment) => ({
     id: text(attachment?.id, 120),
-    name: text(attachment?.name, 240),
-    size: Math.max(0, Number(attachment?.size || 0)),
-    type: text(attachment?.type, 160),
+    name: text(attachment?.name || attachment?.fileName, 240),
+    size: Math.max(0, Number(attachment?.size ?? attachment?.byteSize ?? 0)),
+    type: text(attachment?.type || attachment?.mimeType, 160),
     visibility,
   }))
+}
+
+function safeFileName(value) {
+  const name = text(value, 220).replace(/[\r\n\\/]+/g, '-').replace(/^\.+/, '')
+  return name || 'attachment'
+}
+
+function attachmentResponse(row) {
+  const encoded = encodeURIComponent(row.file_name || 'attachment')
+  return new Response(row.content, {
+    status: 200,
+    headers: {
+      'Content-Type': row.mime_type || 'application/octet-stream',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`,
+      'Cache-Control': 'private, no-store',
+    },
+  })
 }
 
 function operationalValues(input) {
@@ -227,7 +245,7 @@ export function registerServiceRequestOperationRoutes(app) {
             request,
             actor,
             kind: 'system',
-            visibility: 'customer',
+            visibility: 'internal',
             bodyText: `${actor.snapshot.name} changed ${descriptions.join(' and ')}.`,
             metadata: { event: 'request.updated', fields: descriptions },
           })
@@ -312,14 +330,34 @@ export function registerServiceRequestOperationRoutes(app) {
         }
 
         const operational = { ...asObject(request.operational_data), ...operationalValues(values) }
+        let pausedSeconds = Number(request.sla_paused_seconds || 0)
+        let responseDueAt = request.response_due_at
+        let resolutionDueAt = request.resolution_due_at
+        let slaPausedAt = request.sla_paused_at
+        if (request.sla_paused_at && targetStatus !== 'Pending Approval') {
+          const deltaSeconds = Math.max(0, Math.floor((Date.now() - new Date(request.sla_paused_at).getTime()) / 1000))
+          pausedSeconds += deltaSeconds
+          responseDueAt = responseDueAt ? new Date(new Date(responseDueAt).getTime() + deltaSeconds * 1000) : null
+          resolutionDueAt = resolutionDueAt ? new Date(new Date(resolutionDueAt).getTime() + deltaSeconds * 1000) : null
+          slaPausedAt = null
+        }
+        if (targetStatus === 'Pending Approval' && !slaPausedAt) slaPausedAt = new Date()
+        const resolvedAt = targetStatus === 'Completed'
+          ? (request.resolved_at || new Date())
+          : request.status === 'Completed' && targetStatus === 'In Progress' ? null : request.resolved_at
         await client.query(
           `UPDATE service_requests
            SET status = $2,
                operational_data = $3::jsonb,
+               response_due_at = $4,
+               resolution_due_at = $5,
+               sla_paused_at = $6,
+               sla_paused_seconds = $7,
+               resolved_at = $8,
                closed_at = CASE WHEN $2 = 'Closed' THEN now() ELSE closed_at END,
                updated_at = now()
            WHERE id = $1`,
-          [request.id, targetStatus, JSON.stringify(operational)],
+          [request.id, targetStatus, JSON.stringify(operational), responseDueAt, resolutionDueAt, slaPausedAt, pausedSeconds, resolvedAt],
         )
 
         if (targetStatus === 'Approved') {
@@ -395,7 +433,13 @@ export function registerServiceRequestOperationRoutes(app) {
         attachments,
         metadata: { event: 'request.comment.added' },
       })
-      await client.query('UPDATE service_requests SET updated_at = now() WHERE id = $1', [locked.id])
+      await client.query(
+        `UPDATE service_requests
+         SET first_response_at = CASE WHEN $2 THEN COALESCE(first_response_at, now()) ELSE first_response_at END,
+             updated_at = now()
+         WHERE id = $1`,
+        [locked.id, visibility === 'customer' && auth.session.tenant_role !== 'requester'],
+      )
       return activity
     })
 
@@ -409,6 +453,112 @@ export function registerServiceRequestOperationRoutes(app) {
       attachments: result.attachments || [],
       createdAt: result.created_at,
     }, 201)
+  })
+
+  app.post('/api/v1/service-requests/:reference/attachments', async (c) => {
+    const auth = await requireSession(c)
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+
+    const request = await findRequest(pool, auth.session.tenant_id, c.req.param('reference'))
+    if (!request || !requesterCanRead(auth.session, request)) return c.json({ error: 'Service Request not found.' }, 404)
+    const fileName = safeFileName(body?.fileName)
+    const mimeType = text(body?.mimeType || 'application/octet-stream', 180) || 'application/octet-stream'
+    const encoded = String(body?.contentBase64 || '').replace(/^data:[^;]+;base64,/, '')
+    let content
+    try { content = Buffer.from(encoded, 'base64') } catch { return c.json({ error: 'Attachment content is invalid.' }, 400) }
+    if (!content.length) return c.json({ error: 'Choose a non-empty file.' }, 400)
+    if (content.length > 5 * 1024 * 1024) return c.json({ error: 'Attachments are limited to 5 MB each.' }, 413)
+    const visibility = auth.session.tenant_role === 'requester' ? 'customer' : (body?.visibility === 'customer' ? 'customer' : 'internal')
+    const sha256 = createHash('sha256').update(content).digest('hex')
+
+    const result = await withTransaction(async (client) => {
+      const locked = await findRequest(client, auth.session.tenant_id, request.reference, true)
+      const actor = await actorContext(client, auth.session)
+      const attachment = await client.query(
+        `INSERT INTO service_request_attachments (
+           tenant_id,request_id,file_name,mime_type,byte_size,sha256,content,visibility,uploaded_by_user_id,uploaded_by_snapshot
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+         RETURNING id,file_name,mime_type,byte_size,sha256,visibility,created_at`,
+        [auth.session.tenant_id, locked.id, fileName, mimeType, content.length, sha256, content, visibility, auth.session.user_id, JSON.stringify(actor.snapshot)],
+      )
+      const saved = attachment.rows[0]
+      if (body?.recordActivity !== false) {
+        await insertActivity(client, {
+          session: auth.session,
+          request: locked,
+          actor,
+          kind: visibility === 'customer' ? 'customer' : 'work',
+          visibility,
+          bodyText: `Attached ${fileName}.`,
+          attachments: [{ id: saved.id, name: fileName, size: content.length, type: mimeType, visibility }],
+          metadata: { event: 'request.attachment.added', attachmentId: saved.id, sha256 },
+        })
+        await client.query(
+          `UPDATE service_requests
+           SET first_response_at = CASE WHEN $2 THEN COALESCE(first_response_at, now()) ELSE first_response_at END,
+               updated_at = now()
+           WHERE id = $1`,
+          [locked.id, visibility === 'customer' && auth.session.tenant_role !== 'requester'],
+        )
+      } else {
+        await client.query('UPDATE service_requests SET updated_at = now() WHERE id = $1', [locked.id])
+      }
+      return saved
+    })
+    return c.json({
+      id: result.id, fileName: result.file_name, mimeType: result.mime_type, byteSize: Number(result.byte_size),
+      sha256: result.sha256, visibility: result.visibility, createdAt: result.created_at,
+    }, 201)
+  })
+
+  app.get('/api/v1/service-requests/:reference/attachments/:attachmentId', async (c) => {
+    const auth = await requireSession(c)
+    if (auth.error) return auth.error
+    const request = await findRequest(pool, auth.session.tenant_id, c.req.param('reference'))
+    if (!request || !requesterCanRead(auth.session, request)) return c.json({ error: 'Service Request not found.' }, 404)
+    const result = await pool.query(
+      `SELECT file_name,mime_type,content,visibility FROM service_request_attachments
+       WHERE id::text=$1 AND tenant_id=$2 AND request_id=$3 LIMIT 1`,
+      [text(c.req.param('attachmentId'), 80), auth.session.tenant_id, request.id],
+    )
+    if (!result.rowCount || (auth.session.tenant_role === 'requester' && result.rows[0].visibility !== 'customer')) {
+      return c.json({ error: 'Attachment not found.' }, 404)
+    }
+    const attachment = result.rows[0]
+    return new Response(attachment.content, {
+      status: 200,
+      headers: {
+        'Content-Type': attachment.mime_type || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${safeFileName(attachment.file_name).replace(/"/g, '')}"`,
+        'Cache-Control': 'private, no-store',
+      },
+    })
+  })
+
+  app.post('/api/v1/service-requests/:reference/attachments/remove', async (c) => {
+    const auth = await requireSession(c, true)
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+    const request = await findRequest(pool, auth.session.tenant_id, c.req.param('reference'))
+    if (!request) return c.json({ error: 'Service Request not found.' }, 404)
+    const removed = await pool.query(
+      `DELETE FROM service_request_attachments
+       WHERE id::text=$1 AND tenant_id=$2 AND request_id=$3
+       RETURNING file_name`,
+      [text(body?.attachmentId, 80), auth.session.tenant_id, request.id],
+    )
+    if (!removed.rowCount) return c.json({ error: 'Attachment not found.' }, 404)
+    const actor = await actorContext(pool, auth.session)
+    await insertActivity(pool, {
+      session: auth.session, request, actor, kind: 'work', visibility: 'internal',
+      bodyText: `Removed attachment ${removed.rows[0].file_name}.`,
+      metadata: { event: 'request.attachment.removed', attachmentId: text(body?.attachmentId, 80) },
+    })
+    await pool.query('UPDATE service_requests SET updated_at=now() WHERE id=$1', [request.id])
+    return c.json({ ok: true })
   })
 
   app.patch('/api/v1/service-requests/:reference/tasks/:taskKey', async (c) => {

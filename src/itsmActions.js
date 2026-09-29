@@ -1,6 +1,9 @@
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
+import { assignmentDirectory } from './assignment.js'
+
+const recordTaskStatuses = new Set(['Open', 'In Progress', 'Blocked', 'Completed', 'Cancelled'])
 
 function text(value, max = 255) {
   return String(value ?? '').trim().slice(0, max)
@@ -68,6 +71,15 @@ function personSnapshot(person) {
   return person
     ? { id: person.external_key, name: person.name, email: person.email, jobTitle: person.job_title || '' }
     : { id: '', name: 'Unassigned', email: '' }
+}
+
+async function assignmentEligibilityError(client, tenantId, recordType, teamId, personId, personName = 'The selected assignee', teamName = 'the selected team') {
+  if (!personId) return ''
+  if (!teamId) return 'Choose an assignment group before selecting an assignee.'
+  const directory = await assignmentDirectory(client, tenantId, recordType)
+  const eligibleTeam = directory.teams.find((item) => item.databaseId === teamId)
+  const eligible = eligibleTeam?.members?.some((item) => item.databaseId === personId)
+  return eligible ? '' : `${personName} is not an eligible member of ${teamName} for ${recordType} work.`
 }
 
 function actorSnapshot(session) {
@@ -150,6 +162,15 @@ export function registerItsmActionRoutes(app) {
       if (requestedTeam && !team) return { invalidTeam: true }
       const assignee = requestedAssignee !== 'Unassigned' ? await personByName(client, auth.session.tenant_id, requestedAssignee) : null
       if (requestedAssignee !== 'Unassigned' && !assignee) return { invalidAssignee: true }
+      if (assignee && !team) return { invalidAssignment: 'Choose an assignment group before selecting an assignee.' }
+      if (assignee && team) {
+        const directory = await assignmentDirectory(client, auth.session.tenant_id, current.record_type)
+        const eligibleTeam = directory.teams.find((item) => item.databaseId === team.id)
+        const eligible = eligibleTeam?.members?.some((item) => item.databaseId === assignee.id)
+        if (!eligible) {
+          return { invalidAssignment: `${assignee.name} is not an eligible member of ${team.name} for ${current.record_type} work.` }
+        }
+      }
 
       const fromTeam = object(current.assignment_team_snapshot).name || 'Unassigned'
       const fromAssignee = object(current.assignee_snapshot).name || 'Unassigned'
@@ -198,6 +219,7 @@ export function registerItsmActionRoutes(app) {
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
     if (result.invalidTeam) return c.json({ error: 'Choose an active assignment group from this tenant.' }, 400)
     if (result.invalidAssignee) return c.json({ error: 'Choose an active assignee from this tenant.' }, 400)
+    if (result.invalidAssignment) return c.json({ error: result.invalidAssignment }, 422)
     if (result.conflict) return conflictResponse(c, result.current)
     return c.json({ ok: true, reference: result.updated.reference, version: Number(result.updated.version) })
   })
@@ -383,6 +405,11 @@ export function registerItsmActionRoutes(app) {
       if (requestedTeam && !team) return { invalidTeam: true }
       const assignee = requestedAssignee !== 'Unassigned' ? await personByName(client, auth.session.tenant_id, requestedAssignee) : null
       if (requestedAssignee !== 'Unassigned' && !assignee) return { invalidAssignee: true }
+      const invalidAssignment = await assignmentEligibilityError(
+        client, auth.session.tenant_id, current.record_type, team?.id || null, assignee?.id || null,
+        assignee?.name || requestedAssignee, team?.name || requestedTeam || 'the selected team',
+      )
+      if (invalidAssignment) return { invalidAssignment }
 
       const created = await client.query(
         `INSERT INTO itsm_record_tasks (
@@ -434,6 +461,7 @@ export function registerItsmActionRoutes(app) {
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
     if (result.invalidTeam) return c.json({ error: 'Choose an active assignment group from this tenant.' }, 400)
     if (result.invalidAssignee) return c.json({ error: 'Choose an active assignee from this tenant.' }, 400)
+    if (result.invalidAssignment) return c.json({ error: result.invalidAssignment }, 422)
     if (result.conflict) return conflictResponse(c, result.current)
     return c.json({
       task: {
@@ -444,5 +472,123 @@ export function registerItsmActionRoutes(app) {
         createdAt: result.created.created_at,
       },
     }, 201)
+  })
+
+  app.patch('/api/v1/itsm-actions/:reference/tasks/:taskId', async (c) => {
+    const auth = await requireTechnician(c)
+    if (auth.error) return auth.error
+    const body = await parseJson(c)
+    if (!body) return c.json({ error: 'A valid JSON request body is required.' }, 400)
+    const version = expectedVersion(body)
+    if (!version) return c.json({ error: 'A valid record version is required.' }, 400)
+
+    const changeStatus = Object.prototype.hasOwnProperty.call(body, 'status')
+    const changeTeam = Object.prototype.hasOwnProperty.call(body, 'team')
+    const changeAssignee = Object.prototype.hasOwnProperty.call(body, 'assignee')
+    const changeInstructions = Object.prototype.hasOwnProperty.call(body, 'instructions')
+    const changeDueAt = Object.prototype.hasOwnProperty.call(body, 'dueAt')
+    if (!changeStatus && !changeTeam && !changeAssignee && !changeInstructions && !changeDueAt) {
+      return c.json({ error: 'No supported task fields were supplied.' }, 400)
+    }
+    if (changeStatus && !recordTaskStatuses.has(body.status)) return c.json({ error: 'Unsupported task status.' }, 400)
+    const dueAt = changeDueAt && body.dueAt ? new Date(body.dueAt) : null
+    if (dueAt && Number.isNaN(dueAt.getTime())) return c.json({ error: 'Choose a valid task due date.' }, 400)
+
+    const result = await withTransaction(async (client) => {
+      const current = await recordFor(client, auth.session.tenant_id, c.req.param('reference'), true)
+      if (!current) return { notFound: true }
+      if (Number(current.version || 1) !== version) return { conflict: true, current }
+      const taskResult = await client.query(
+        `SELECT * FROM itsm_record_tasks
+         WHERE tenant_id = $1 AND record_id = $2 AND id::text = $3
+         LIMIT 1 FOR UPDATE`,
+        [auth.session.tenant_id, current.id, text(c.req.param('taskId'), 80)],
+      )
+      if (!taskResult.rowCount) return { taskNotFound: true }
+      const task = taskResult.rows[0]
+
+      const requestedTeam = changeTeam ? text(body.team, 160) : ''
+      const requestedAssignee = changeAssignee ? (text(body.assignee, 180) || 'Unassigned') : ''
+      const team = changeTeam && requestedTeam ? await teamByName(client, auth.session.tenant_id, requestedTeam) : null
+      if (changeTeam && requestedTeam && !team) return { invalidTeam: true }
+      const assignee = changeAssignee && requestedAssignee !== 'Unassigned'
+        ? await personByName(client, auth.session.tenant_id, requestedAssignee)
+        : null
+      if (changeAssignee && requestedAssignee !== 'Unassigned' && !assignee) return { invalidAssignee: true }
+      if (changeTeam || changeAssignee) {
+        const effectiveTeamId = changeTeam ? (team?.id || null) : task.team_id
+        const effectivePersonId = changeAssignee ? (assignee?.id || null) : task.assignee_person_id
+        const effectivePersonName = changeAssignee ? (assignee?.name || requestedAssignee) : (object(task.assignee_snapshot).name || 'The selected assignee')
+        const effectiveTeamName = changeTeam ? (team?.name || requestedTeam || 'the selected team') : (object(task.team_snapshot).name || 'the selected team')
+        const invalidAssignment = await assignmentEligibilityError(
+          client, auth.session.tenant_id, current.record_type, effectiveTeamId, effectivePersonId,
+          effectivePersonName, effectiveTeamName,
+        )
+        if (invalidAssignment) return { invalidAssignment }
+      }
+
+      const updated = await client.query(
+        `UPDATE itsm_record_tasks SET
+           status = CASE WHEN $2 THEN $3 ELSE status END,
+           team_id = CASE WHEN $4 THEN $5 ELSE team_id END,
+           team_snapshot = CASE WHEN $4 THEN $6::jsonb ELSE team_snapshot END,
+           assignee_person_id = CASE WHEN $7 THEN $8 ELSE assignee_person_id END,
+           assignee_snapshot = CASE WHEN $7 THEN $9::jsonb ELSE assignee_snapshot END,
+           instructions = CASE WHEN $10 THEN $11 ELSE instructions END,
+           due_at = CASE WHEN $12 THEN $13 ELSE due_at END,
+           completed_at = CASE WHEN $2 AND $3 = 'Completed' THEN COALESCE(completed_at, now()) WHEN $2 AND $3 <> 'Completed' THEN NULL ELSE completed_at END,
+           updated_at = now()
+         WHERE id = $1
+         RETURNING *`,
+        [task.id, changeStatus, changeStatus ? body.status : task.status, changeTeam, team?.id || null,
+          JSON.stringify(teamSnapshot(team, requestedTeam)), changeAssignee, assignee?.id || null,
+          JSON.stringify(personSnapshot(assignee)), changeInstructions, text(body.instructions, 20000),
+          changeDueAt, dueAt],
+      )
+      const next = updated.rows[0]
+      const recordUpdate = await client.query(
+        `UPDATE itsm_records SET version = version + 1, updated_at = now()
+         WHERE tenant_id = $1 AND id = $2 RETURNING version`,
+        [auth.session.tenant_id, current.id],
+      )
+      const changes = []
+      if (changeStatus && task.status !== next.status) changes.push(`status ${task.status} → ${next.status}`)
+      if (changeTeam) changes.push(`team → ${object(next.team_snapshot).name || 'Unassigned'}`)
+      if (changeAssignee) changes.push(`assignee → ${object(next.assignee_snapshot).name || 'Unassigned'}`)
+      if (changeDueAt) changes.push(`due date → ${next.due_at ? new Date(next.due_at).toISOString() : 'None'}`)
+      if (changeInstructions) changes.push('instructions updated')
+      await addActivity(client, {
+        tenantId: auth.session.tenant_id,
+        recordId: current.id,
+        session: auth.session,
+        kind: 'task',
+        visibility: 'internal',
+        bodyText: `Task ${next.title} updated${changes.length ? `: ${changes.join(', ')}` : '.'}`,
+        metadata: activityMetadata(body, { action: 'task_updated', taskId: next.id, changes }),
+      })
+      return { task: next, version: Number(recordUpdate.rows[0].version) }
+    })
+
+    if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (result.taskNotFound) return c.json({ error: 'ITSM record task not found.' }, 404)
+    if (result.invalidTeam) return c.json({ error: 'Choose an active assignment group from this tenant.' }, 400)
+    if (result.invalidAssignee) return c.json({ error: 'Choose an active assignee from this tenant.' }, 400)
+    if (result.invalidAssignment) return c.json({ error: result.invalidAssignment }, 422)
+    if (result.conflict) return conflictResponse(c, result.current)
+    return c.json({
+      ok: true,
+      version: result.version,
+      task: {
+        id: result.task.id,
+        title: result.task.title,
+        status: result.task.status,
+        team: object(result.task.team_snapshot).name || '',
+        assignee: object(result.task.assignee_snapshot).name || 'Unassigned',
+        instructions: result.task.instructions,
+        dueAt: result.task.due_at,
+        completedAt: result.task.completed_at,
+        updatedAt: result.task.updated_at,
+      },
+    })
   })
 }

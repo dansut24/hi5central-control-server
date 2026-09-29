@@ -5,6 +5,12 @@ import { originMatchesTenant, portalRequestFromHeaders } from './deploymentConfi
 const allowedPriorities = new Set(['Low', 'Medium', 'High', 'Critical'])
 const allowedDecisions = new Set(['Approved', 'Rejected'])
 const maxFieldsBytes = 250_000
+const defaultServiceRequestSlaTargets = {
+  Critical: { responseMinutes: 30, resolutionMinutes: 480 },
+  High: { responseMinutes: 60, resolutionMinutes: 960 },
+  Medium: { responseMinutes: 240, resolutionMinutes: 2880 },
+  Low: { responseMinutes: 480, resolutionMinutes: 5760 },
+}
 
 function originMatchesSession(c, session) {
   return originMatchesTenant(c.req.header('origin'), session.slug)
@@ -84,6 +90,33 @@ async function numberingSettings(client, tenantId) {
   const prefix = prefixBase.endsWith('-') ? prefixBase : `${prefixBase}-`
   const digits = Math.max(4, Math.min(8, Number(itsm.recordDigits || 5)))
   return { prefix, digits, config }
+}
+
+function serviceRequestSlaTarget(priority, configuration = {}) {
+  const itsm = asObject(configuration.itsm)
+  const configured = asObject(asObject(itsm.serviceRequestSlaTargets)[priority])
+  const fallback = defaultServiceRequestSlaTargets[priority] || defaultServiceRequestSlaTargets.Medium
+  const responseMinutes = Math.max(1, Math.min(43200, Number(configured.responseMinutes || fallback.responseMinutes)))
+  const resolutionMinutes = Math.max(responseMinutes, Math.min(129600, Number(configured.resolutionMinutes || fallback.resolutionMinutes)))
+  return { responseMinutes, resolutionMinutes }
+}
+
+function slaMetric(createdAt, dueAt, completedAt, pausedAt) {
+  if (!dueAt) return null
+  const start = new Date(createdAt).getTime()
+  const due = new Date(dueAt).getTime()
+  const effectiveEnd = completedAt ? new Date(completedAt).getTime() : pausedAt ? new Date(pausedAt).getTime() : Date.now()
+  const total = Math.max(1, due - start)
+  const elapsed = Math.max(0, effectiveEnd - start)
+  const percent = Math.max(0, Math.min(999, Math.round((elapsed / total) * 100)))
+  const breached = effectiveEnd > due
+  return {
+    dueAt,
+    completedAt: completedAt || null,
+    percent,
+    breached,
+    state: completedAt ? (new Date(completedAt).getTime() <= due ? 'met' : 'breached') : breached ? 'breached' : percent >= 75 ? 'warning' : 'on_track',
+  }
 }
 
 async function nextReference(client, tenantId) {
@@ -302,12 +335,16 @@ function safeAttachments(value) {
   }))
 }
 
-async function requestPayload(db, requestRow) {
-  const [itemsResult, approvalsResult, tasksResult, activitiesResult] = await Promise.all([
+async function requestPayload(db, requestRow, { requesterView = false } = {}) {
+  const [itemsResult, approvalsResult, tasksResult, activitiesResult, attachmentsResult, assigneeResult] = await Promise.all([
     db.query('SELECT * FROM service_request_items WHERE request_id = $1 ORDER BY created_at, id', [requestRow.id]),
     db.query('SELECT * FROM service_request_approvals WHERE request_id = $1 ORDER BY sequence, created_at', [requestRow.id]),
     db.query('SELECT * FROM service_request_tasks WHERE request_id = $1 ORDER BY created_at, id', [requestRow.id]),
     db.query('SELECT * FROM service_request_activities WHERE request_id = $1 ORDER BY created_at, id', [requestRow.id]),
+    db.query('SELECT id,file_name,mime_type,byte_size,sha256,visibility,uploaded_by_snapshot,created_at FROM service_request_attachments WHERE request_id = $1 ORDER BY created_at DESC', [requestRow.id]),
+    requestRow.assigned_person_id
+      ? db.query('SELECT external_key,name,email FROM organisation_people WHERE tenant_id=$1 AND id=$2 LIMIT 1', [requestRow.tenant_id, requestRow.assigned_person_id])
+      : Promise.resolve({ rows: [] }),
   ])
 
   return {
@@ -328,6 +365,9 @@ async function requestPayload(db, requestRow) {
     requesterSnapshot: requestRow.requester_snapshot || {},
     service: requestRow.service,
     team: asObject(requestRow.fulfilment_team_snapshot).name || '',
+    assignee: assigneeResult.rows[0]?.name || 'Unassigned',
+    assigneeEmail: assigneeResult.rows[0]?.email || '',
+    assigneeId: assigneeResult.rows[0]?.external_key || '',
     priority: requestRow.priority,
     status: requestRow.status,
     source: requestRow.source,
@@ -341,6 +381,15 @@ async function requestPayload(db, requestRow) {
     workflow: requestRow.workflow_key_snapshot,
     createdAt: requestRow.created_at,
     updatedAt: requestRow.updated_at,
+    firstResponseAt: requestRow.first_response_at,
+    resolvedAt: requestRow.resolved_at,
+    sla: {
+      paused: Boolean(requestRow.sla_paused_at),
+      pausedAt: requestRow.sla_paused_at,
+      pausedSeconds: Number(requestRow.sla_paused_seconds || 0),
+      response: slaMetric(requestRow.created_at, requestRow.response_due_at, requestRow.first_response_at, requestRow.sla_paused_at),
+      resolution: slaMetric(requestRow.created_at, requestRow.resolution_due_at, requestRow.resolved_at || requestRow.closed_at, requestRow.sla_paused_at),
+    },
     requestedItems: itemsResult.rows.map((item) => ({
       databaseId: item.id,
       id: item.catalogue_item_key_snapshot,
@@ -376,7 +425,17 @@ async function requestPayload(db, requestRow) {
       dueAt: task.due_at,
       completionNotes: task.completion_notes,
     })),
-    activities: activitiesResult.rows.map((activity) => ({
+    attachments: attachmentsResult.rows.filter((attachment) => !requesterView || attachment.visibility === 'customer').map((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.file_name,
+      mimeType: attachment.mime_type,
+      byteSize: Number(attachment.byte_size),
+      sha256: attachment.sha256,
+      visibility: attachment.visibility,
+      uploadedBy: asObject(attachment.uploaded_by_snapshot).name || 'Unknown',
+      createdAt: attachment.created_at,
+    })),
+    activities: activitiesResult.rows.filter((activity) => !requesterView || activity.visibility === 'customer').map((activity) => ({
       id: activity.id,
       actor: asObject(activity.actor_snapshot).name || 'Hi5Central',
       kind: activity.kind,
@@ -425,7 +484,7 @@ export function registerServiceRequestRoutes(app) {
     )
 
     const items = []
-    for (const row of result.rows) items.push(await requestPayload(pool, row))
+    for (const row of result.rows) items.push(await requestPayload(pool, row, { requesterView: auth.session.tenant_role === 'requester' }))
     return c.json({ items, limit, offset })
   })
 
@@ -434,7 +493,7 @@ export function registerServiceRequestRoutes(app) {
     if (auth.error) return auth.error
     const row = await lookupRequest(auth.session.tenant_id, c.req.param('reference'))
     if (!row || !canReadRequest(auth.session, row)) return c.json({ error: 'Service Request not found.' }, 404)
-    return c.json(await requestPayload(pool, row))
+    return c.json(await requestPayload(pool, row, { requesterView: auth.session.tenant_role === 'requester' }))
   })
 
   app.post('/api/v1/service-requests', async (c) => {
@@ -538,8 +597,8 @@ export function registerServiceRequestRoutes(app) {
             priority,
             approval ? 'Pending Approval' : 'New',
             portalSource ? 'portal' : 'technician',
-            null,
-            JSON.stringify({}),
+            teamId || null,
+            JSON.stringify({ id: teamId || '', name: teamName }),
             JSON.stringify(fields),
             JSON.stringify(requestInformation(schema, fields)),
             form.approval_mode || 'none',
@@ -551,7 +610,24 @@ export function registerServiceRequestRoutes(app) {
             auth.session.user_id,
           ],
         )
-        const request = requestResult.rows[0]
+        let request = requestResult.rows[0]
+        const slaTarget = serviceRequestSlaTarget(priority, config)
+        const createdAt = new Date(request.created_at).getTime()
+        const slaResult = await client.query(
+          `UPDATE service_requests
+           SET response_due_at = $2,
+               resolution_due_at = $3,
+               sla_paused_at = CASE WHEN $4 THEN now() ELSE NULL END
+           WHERE id = $1
+           RETURNING *`,
+          [
+            request.id,
+            new Date(createdAt + slaTarget.responseMinutes * 60000),
+            new Date(createdAt + slaTarget.resolutionMinutes * 60000),
+            Boolean(approval),
+          ],
+        )
+        request = slaResult.rows[0]
 
         for (const item of priced.items) {
           await client.query(
@@ -631,7 +707,7 @@ export function registerServiceRequestRoutes(app) {
           ],
         )
 
-        return requestPayload(client, request)
+        return requestPayload(client, request, { requesterView: auth.session.tenant_role === 'requester' })
       })
 
       return c.json(created, 201)
@@ -717,6 +793,6 @@ export function registerServiceRequestRoutes(app) {
     })
 
     const refreshed = await lookupRequest(auth.session.tenant_id, row.reference)
-    return c.json(await requestPayload(pool, refreshed))
+    return c.json(await requestPayload(pool, refreshed, { requesterView: auth.session.tenant_role === 'requester' }))
   })
 }

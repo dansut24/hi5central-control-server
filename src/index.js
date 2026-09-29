@@ -34,6 +34,7 @@ import { pool, withTransaction } from './db.js'
 import { sendVerificationEmail, verifySmtpConnection } from './mailer.js'
 import { registerOrganisationRoutes } from './organisation.js'
 import { registerPlatformAdminRoutes } from './platformAdmin.js'
+import { registerProjectRoutes } from './projects.js'
 import { verifyPassword } from './password.js'
 import { ensureRedisConnected, redis } from './redis.js'
 import { registerSettingsRoutes } from './settings.js'
@@ -397,6 +398,7 @@ registerLicensingRoutes(app)
 registerCatalogueRoutes(app)
 registerOrganisationRoutes(app)
 registerSettingsRoutes(app)
+registerProjectRoutes(app)
 registerMicrosoftRoutes(app)
 registerRmmAgentRoutes(app)
 registerRmmAutomationRoutes(app)

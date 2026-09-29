@@ -127,11 +127,14 @@ async function resolveTaskTeams(db, tenantId, tasks) {
     if (!task.team && !task.teamId) return { ...task, team: '', teamId: '' }
     const resolved = byId.get(task.teamId) || byId.get(task.team) || byName.get(task.team.toLowerCase())
     if (!resolved) {
-      const error = new Error(`The team selected for ${task.title} is no longer active.`)
-      error.status = 400
-      throw error
+      return {
+        ...task,
+        team: '',
+        teamId: '',
+        routingWarning: `Configured fulfilment team ${task.team || task.teamId} is no longer active; task created unassigned.`,
+      }
     }
-    return { ...task, team: resolved.name, teamId: resolved.external_key }
+    return { ...task, team: resolved.name, teamId: resolved.external_key, routingWarning: '' }
   })
 }
 
