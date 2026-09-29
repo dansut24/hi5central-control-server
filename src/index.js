@@ -48,6 +48,7 @@ import {
 const scryptAsync = promisify(scrypt)
 const app = new Hono()
 const port = Number(process.env.PORT || 3001)
+const backgroundWorkersEnabled = !['0', 'false', 'off', 'no'].includes(String(process.env.BACKGROUND_WORKERS_ENABLED || 'true').trim().toLowerCase())
 const marketingUrl = deployment.marketingUrl || deployment.appUrl || `https://${deployment.rootDomain}`
 
 const reservedSlugs = new Set([
@@ -141,6 +142,8 @@ app.get('/api/v1/system/deployment', (c) => c.json({
   apiUrl: deployment.apiUrl,
   portalUrl: deployment.portalUrl,
   rmmUrl: deployment.rmmUrl,
+  adminUrl: deployment.adminUrl,
+  backgroundWorkersEnabled,
 }))
 
 app.get('/api/v1/system/smtp-health', async (c) => {
@@ -416,12 +419,16 @@ app.onError((error, c) => {
 
 await pool.query('SELECT 1')
 await ensureRedisConnected()
-startMicrosoftSyncScheduler()
-startRmmVulnerabilitySyncScheduler()
-startSoftwareVendorSyncScheduler()
-startTenantVendorSourceScheduler()
-startRmmNetworkDiscoveryScheduler()
-startRmmMacOuiScheduler()
+if (backgroundWorkersEnabled) {
+  startMicrosoftSyncScheduler()
+  startRmmVulnerabilitySyncScheduler()
+  startSoftwareVendorSyncScheduler()
+  startTenantVendorSourceScheduler()
+  startRmmNetworkDiscoveryScheduler()
+  startRmmMacOuiScheduler()
+} else {
+  console.log('Background workers disabled for this Control Server instance')
+}
 const server = serve({ fetch: app.fetch, hostname: '0.0.0.0', port })
 attachRmmAgentWebSocket(server)
 attachRmmViewerWebSocket(server)
