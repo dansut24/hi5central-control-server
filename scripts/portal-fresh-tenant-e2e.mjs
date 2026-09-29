@@ -17,10 +17,10 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
-function cookieFrom(response) {
+function cookieFrom(response, name = 'hi5central_session') {
   const raw = response.headers.get('set-cookie') || ''
-  const match = raw.match(/hi5central_session=([^;]+)/)
-  return match ? `hi5central_session=${match[1]}` : ''
+  const match = raw.match(new RegExp(`${name}=([^;]+)`))
+  return match ? `${name}=${match[1]}` : ''
 }
 
 async function json(path, { method = 'GET', body, cookie = '', origin = tenantOrigin, redirect = 'follow' } = {}) {
@@ -226,7 +226,7 @@ try {
     method: 'POST', origin: portalOrigin, body: { tenantSlug: slug, email: requesterEmail, password: requesterPassword },
   })
   assert(requesterLogin.response.ok && requesterLogin.payload.user?.role === 'requester', `Requester login failed: ${requesterLogin.payload.error || requesterLogin.response.status}`)
-  const requesterCookie = cookieFrom(requesterLogin.response)
+  const requesterCookie = cookieFrom(requesterLogin.response, 'hi5central_portal_session')
   assert(requesterCookie, 'Requester login did not issue a Portal session cookie')
   const requesterSession = await json('/api/v1/portal/auth/session', { cookie: requesterCookie, origin: portalOrigin })
   assert(requesterSession.response.ok && requesterSession.payload.user?.tenantRole === 'requester', 'Requester Portal session was not restored')
