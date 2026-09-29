@@ -4,6 +4,7 @@ import { WebSocketServer } from 'ws'
 import { hasPermission } from './access.js'
 import { originMatchesTenant } from './deploymentConfig.js'
 import { pool, withTransaction } from './db.js'
+import { ensureRedisConnected, redis } from './redis.js'
 import { recordJobCompletionActivity, recordRmmActivity } from './rmmActivity.js'
 import {
   reconcileNetworkDiscoveryEnrichmentJobResult,
@@ -16,6 +17,14 @@ import { resolveSession } from './session.js'
 
 const AGENT_DOWNLOAD_URL = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe'
 const MAX_INVENTORY_BYTES = 8 * 1024 * 1024
+const AGENT_BROKER_INSTANCE_ID = String(process.env.API_INSTANCE_ID || process.env.HOSTNAME || `api-${process.pid}`) + '-' + randomUUID().slice(0, 8)
+const AGENT_BROKER_OWNER_HASH = 'hi5central:rmm:agent:owners'
+const AGENT_BROKER_SEEN_HASH = 'hi5central:rmm:agent:owner-seen'
+const AGENT_BROKER_COMMAND_CHANNEL = 'hi5central:rmm:agent:command'
+const AGENT_BROKER_MESSAGE_CHANNEL = 'hi5central:rmm:agent:message'
+const AGENT_BROKER_PRESENCE_CHANNEL = 'hi5central:rmm:agent:presence'
+const AGENT_BROKER_HEARTBEAT_MS = 5_000
+const AGENT_BROKER_STALE_MS = 20_000
 
 function clean(value = '') { return String(value ?? '').trim() }
 function isUuid(value = '') { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean(value)) }
@@ -1161,9 +1170,258 @@ export function registerRmmAgentRoutes(app) {
 const liveAgentSockets = new Map()
 const agentMessageSubscribers = new Map()
 const agentConnectionSubscribers = new Set()
+const brokerAgentPresence = new Map()
+const brokerProxySockets = new Map()
+let agentBrokerPublisher = null
+let agentBrokerSubscriber = null
+let agentBrokerHeartbeatTimer = null
+let agentBrokerPruneTimer = null
+let agentBrokerStarted = false
+
+function notifyAgentConnectionSubscribers(event) {
+  for (const handler of [...agentConnectionSubscribers]) {
+    try { handler(event) } catch {}
+  }
+}
+
+function notifyAgentMessageSubscribers(deviceId, payload) {
+  const subscribers = agentMessageSubscribers.get(String(deviceId))
+  if (!subscribers?.size) return
+  for (const handler of [...subscribers]) {
+    try { handler(payload) } catch {}
+  }
+}
+
+function brokerPresenceForDevice(deviceId) {
+  const key = String(deviceId)
+  const entry = brokerAgentPresence.get(key)
+  if (!entry) return null
+  if (!entry.seenAt || Date.now() - entry.seenAt > AGENT_BROKER_STALE_MS) {
+    brokerAgentPresence.delete(key)
+    return null
+  }
+  return entry
+}
+
+function brokerProxyForDevice(deviceId) {
+  const key = String(deviceId)
+  if (brokerProxySockets.has(key)) return brokerProxySockets.get(key)
+  const listenerUnsubscribes = new Map()
+  const proxy = {
+    hi5BrokerProxy: true,
+    deviceId: key,
+    get readyState() {
+      const presence = brokerPresenceForDevice(key)
+      return presence && presence.instanceId !== AGENT_BROKER_INSTANCE_ID ? 1 : 3
+    },
+    send(data) {
+      const presence = brokerPresenceForDevice(key)
+      if (!presence || presence.instanceId === AGENT_BROKER_INSTANCE_ID || !agentBrokerPublisher?.isOpen) {
+        throw new Error('Remote Agent broker owner is unavailable.')
+      }
+      const payloadText = typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : String(data)
+      const envelope = JSON.stringify({
+        sourceInstanceId: AGENT_BROKER_INSTANCE_ID,
+        deviceId: key,
+        payload: payloadText,
+        createdAt: Date.now(),
+      })
+      agentBrokerPublisher.publish(AGENT_BROKER_COMMAND_CHANNEL, envelope)
+        .catch((error) => console.error('RMM Agent broker command publish failed', key, error.message))
+    },
+    on(event, handler) {
+      if (event !== 'message' || typeof handler !== 'function' || listenerUnsubscribes.has(handler)) return proxy
+      const unsubscribe = subscribeAgentMessages(key, (payload) => {
+        try { handler(JSON.stringify(payload)) } catch {}
+      })
+      listenerUnsubscribes.set(handler, unsubscribe)
+      return proxy
+    },
+    off(event, handler) {
+      if (event !== 'message' || typeof handler !== 'function') return proxy
+      const unsubscribe = listenerUnsubscribes.get(handler)
+      if (unsubscribe) {
+        listenerUnsubscribes.delete(handler)
+        try { unsubscribe() } catch {}
+      }
+      return proxy
+    },
+  }
+  brokerProxySockets.set(key, proxy)
+  return proxy
+}
+
+async function publishAgentBrokerPresence(type, agentOrDeviceId) {
+  if (!agentBrokerPublisher?.isOpen) return false
+  const deviceId = String(agentOrDeviceId?.id || agentOrDeviceId || '')
+  if (!deviceId) return false
+  const now = Date.now()
+  if (type === 'connected' || type === 'heartbeat') {
+    brokerAgentPresence.set(deviceId, { instanceId: AGENT_BROKER_INSTANCE_ID, seenAt: now })
+    await agentBrokerPublisher.multi()
+      .hSet(AGENT_BROKER_OWNER_HASH, deviceId, AGENT_BROKER_INSTANCE_ID)
+      .hSet(AGENT_BROKER_SEEN_HASH, deviceId, String(now))
+      .exec()
+    await agentBrokerPublisher.publish(AGENT_BROKER_PRESENCE_CHANNEL, JSON.stringify({
+      type,
+      sourceInstanceId: AGENT_BROKER_INSTANCE_ID,
+      deviceId,
+      seenAt: now,
+    }))
+    return true
+  }
+
+  if (type === 'disconnected') {
+    const owner = await agentBrokerPublisher.hGet(AGENT_BROKER_OWNER_HASH, deviceId)
+    if (owner && owner !== AGENT_BROKER_INSTANCE_ID) return false
+    brokerAgentPresence.delete(deviceId)
+    await agentBrokerPublisher.multi()
+      .hDel(AGENT_BROKER_OWNER_HASH, deviceId)
+      .hDel(AGENT_BROKER_SEEN_HASH, deviceId)
+      .exec()
+    await agentBrokerPublisher.publish(AGENT_BROKER_PRESENCE_CHANNEL, JSON.stringify({
+      type,
+      sourceInstanceId: AGENT_BROKER_INSTANCE_ID,
+      deviceId,
+      seenAt: now,
+    }))
+    return true
+  }
+
+  return false
+}
+
+function shouldBrokerAgentPayload(payload) {
+  const type = clean(payload?.type)
+  return Boolean(type) && ![
+    'inventory_snapshot',
+    'inventory_snapshot_compressed',
+    'bitlocker_recovery_escrow',
+    'hello',
+  ].includes(type)
+}
+
+function publishAgentBrokerMessage(deviceId, payload) {
+  if (!agentBrokerPublisher?.isOpen || !shouldBrokerAgentPayload(payload)) return
+  agentBrokerPublisher.publish(AGENT_BROKER_MESSAGE_CHANNEL, JSON.stringify({
+    sourceInstanceId: AGENT_BROKER_INSTANCE_ID,
+    deviceId: String(deviceId),
+    payload,
+    createdAt: Date.now(),
+  })).catch((error) => console.error('RMM Agent broker message publish failed', deviceId, error.message))
+}
+
+export async function initializeAgentBroker() {
+  if (agentBrokerStarted) return
+  await ensureRedisConnected()
+  agentBrokerPublisher = redis.duplicate()
+  agentBrokerSubscriber = redis.duplicate()
+  agentBrokerPublisher.on('error', (error) => console.error('RMM Agent broker publisher error', error))
+  agentBrokerSubscriber.on('error', (error) => console.error('RMM Agent broker subscriber error', error))
+  await Promise.all([agentBrokerPublisher.connect(), agentBrokerSubscriber.connect()])
+
+  const [owners, seen] = await Promise.all([
+    redis.hGetAll(AGENT_BROKER_OWNER_HASH),
+    redis.hGetAll(AGENT_BROKER_SEEN_HASH),
+  ])
+  const now = Date.now()
+  for (const [deviceId, instanceId] of Object.entries(owners || {})) {
+    const seenAt = Number(seen?.[deviceId] || 0)
+    if (instanceId && seenAt && now - seenAt <= AGENT_BROKER_STALE_MS) {
+      brokerAgentPresence.set(String(deviceId), { instanceId: String(instanceId), seenAt })
+    }
+  }
+
+  await agentBrokerSubscriber.subscribe(AGENT_BROKER_COMMAND_CHANNEL, (message) => {
+    let envelope
+    try { envelope = JSON.parse(message) } catch { return }
+    const deviceId = String(envelope?.deviceId || '')
+    if (!deviceId) return
+    const presence = brokerPresenceForDevice(deviceId)
+    if (!presence || presence.instanceId !== AGENT_BROKER_INSTANCE_ID) return
+    const socket = liveAgentSockets.get(deviceId)
+    if (!socket || socket.readyState !== 1) return
+    try { socket.send(String(envelope.payload || '')) } catch {}
+  })
+
+  await agentBrokerSubscriber.subscribe(AGENT_BROKER_MESSAGE_CHANNEL, (message) => {
+    let envelope
+    try { envelope = JSON.parse(message) } catch { return }
+    if (!envelope || envelope.sourceInstanceId === AGENT_BROKER_INSTANCE_ID) return
+    const deviceId = String(envelope.deviceId || '')
+    if (!deviceId || !envelope.payload || typeof envelope.payload !== 'object') return
+    notifyAgentMessageSubscribers(deviceId, envelope.payload)
+  })
+
+  await agentBrokerSubscriber.subscribe(AGENT_BROKER_PRESENCE_CHANNEL, (message) => {
+    let event
+    try { event = JSON.parse(message) } catch { return }
+    if (!event || event.sourceInstanceId === AGENT_BROKER_INSTANCE_ID) return
+    const deviceId = String(event.deviceId || '')
+    if (!deviceId) return
+    const prior = brokerPresenceForDevice(deviceId)
+    if (event.type === 'connected' || event.type === 'heartbeat') {
+      const next = { instanceId: String(event.sourceInstanceId || ''), seenAt: Number(event.seenAt || Date.now()) }
+      brokerAgentPresence.set(deviceId, next)
+      if (event.type === 'connected' && prior?.instanceId !== next.instanceId) {
+        notifyAgentConnectionSubscribers({ type: 'connected', agent: { id: deviceId }, ws: brokerProxyForDevice(deviceId), brokered: true })
+      }
+      return
+    }
+    if (event.type === 'disconnected') {
+      if (prior?.instanceId && prior.instanceId !== event.sourceInstanceId) return
+      brokerAgentPresence.delete(deviceId)
+      notifyAgentConnectionSubscribers({ type: 'disconnected', agent: { id: deviceId }, ws: brokerProxyForDevice(deviceId), brokered: true })
+    }
+  })
+
+  agentBrokerHeartbeatTimer = setInterval(() => {
+    for (const [deviceId, socket] of liveAgentSockets) {
+      if (socket?.readyState !== 1) continue
+      publishAgentBrokerPresence('heartbeat', deviceId).catch((error) => console.error('RMM Agent broker heartbeat failed', deviceId, error.message))
+    }
+  }, AGENT_BROKER_HEARTBEAT_MS)
+  agentBrokerHeartbeatTimer.unref?.()
+
+  agentBrokerPruneTimer = setInterval(() => {
+    const cutoff = Date.now() - AGENT_BROKER_STALE_MS
+    for (const [deviceId, entry] of brokerAgentPresence) {
+      if (entry.seenAt >= cutoff) continue
+      brokerAgentPresence.delete(deviceId)
+      if (entry.instanceId !== AGENT_BROKER_INSTANCE_ID) {
+        notifyAgentConnectionSubscribers({ type: 'disconnected', agent: { id: deviceId }, ws: brokerProxyForDevice(deviceId), brokered: true })
+      }
+    }
+  }, AGENT_BROKER_HEARTBEAT_MS)
+  agentBrokerPruneTimer.unref?.()
+
+  agentBrokerStarted = true
+  console.log('RMM Agent broker ready', AGENT_BROKER_INSTANCE_ID)
+}
+
+export async function shutdownAgentBroker() {
+  if (agentBrokerHeartbeatTimer) clearInterval(agentBrokerHeartbeatTimer)
+  if (agentBrokerPruneTimer) clearInterval(agentBrokerPruneTimer)
+  agentBrokerHeartbeatTimer = null
+  agentBrokerPruneTimer = null
+  const disconnects = []
+  for (const deviceId of liveAgentSockets.keys()) disconnects.push(publishAgentBrokerPresence('disconnected', deviceId))
+  await Promise.allSettled(disconnects)
+  if (agentBrokerSubscriber?.isOpen) await agentBrokerSubscriber.quit().catch(() => {})
+  if (agentBrokerPublisher?.isOpen) await agentBrokerPublisher.quit().catch(() => {})
+  agentBrokerSubscriber = null
+  agentBrokerPublisher = null
+  agentBrokerStarted = false
+}
 
 export function agentSocketForDevice(deviceId) {
-  return liveAgentSockets.get(String(deviceId)) || null
+  const key = String(deviceId)
+  const local = liveAgentSockets.get(key)
+  if (local?.readyState === 1) return local
+  const presence = brokerPresenceForDevice(key)
+  if (!presence || presence.instanceId === AGENT_BROKER_INSTANCE_ID) return null
+  const proxy = brokerProxyForDevice(key)
+  return proxy.readyState === 1 ? proxy : null
 }
 
 export function sendAgentMessage(deviceId, payload) {
@@ -1181,12 +1439,6 @@ export function subscribeAgentConnections(handler) {
   if (typeof handler !== 'function') return () => {}
   agentConnectionSubscribers.add(handler)
   return () => agentConnectionSubscribers.delete(handler)
-}
-
-function notifyAgentConnectionSubscribers(event) {
-  for (const handler of [...agentConnectionSubscribers]) {
-    try { handler(event) } catch {}
-  }
 }
 
 export function subscribeAgentMessages(deviceId, handler) {
@@ -1225,6 +1477,7 @@ export function attachRmmAgentWebSocket(server) {
   wss.on('connection', async (ws) => {
     const agent = ws.hi5Agent
     liveAgentSockets.set(String(agent.id), ws)
+    await publishAgentBrokerPresence('connected', agent).catch((error) => console.error('RMM Agent broker connect publish failed', agent.id, error.message))
     notifyAgentConnectionSubscribers({ type: 'connected', agent, ws })
     await pool.query(
       `UPDATE rmm_agent_devices SET websocket_status='Connected',websocket_connected_at=now(),last_authenticated_at=now(),updated_at=now() WHERE id=$1`,
@@ -1274,6 +1527,8 @@ export function attachRmmAgentWebSocket(server) {
         }
       }
 
+      publishAgentBrokerMessage(agent.id, payload)
+
       if (payload.type === 'bitlocker_recovery_escrow') {
         if (clean(payload.device_id) && clean(payload.device_id) !== String(agent.id)) return
         ingestBitLockerRecoveryEscrow(agent, payload).catch((error) => console.error('RMM BitLocker recovery escrow ingest failed', agent.id, error.message))
@@ -1318,16 +1573,25 @@ export function attachRmmAgentWebSocket(server) {
       }
     })
 
-    ws.on('close', () => {
+    ws.on('close', async () => {
       const wasCurrentSocket = liveAgentSockets.get(String(agent.id)) === ws
-      if (wasCurrentSocket) {
-        liveAgentSockets.delete(String(agent.id))
-        notifyAgentConnectionSubscribers({ type: 'disconnected', agent, ws })
-      } else {
-        // A replacement Agent socket is already authoritative. Never let the
-        // superseded socket mark the device offline or cancel work.
+      if (!wasCurrentSocket) {
+        // A replacement Agent socket is already authoritative on this instance.
         return
       }
+
+      liveAgentSockets.delete(String(agent.id))
+      const clusterWasCurrentOwner = await publishAgentBrokerPresence('disconnected', agent)
+        .catch((error) => {
+          console.error('RMM Agent broker disconnect publish failed', agent.id, error.message)
+          return true
+        })
+      notifyAgentConnectionSubscribers({ type: 'disconnected', agent, ws })
+
+      // Another API instance may already own a replacement socket. Never let a
+      // superseded instance mark the shared device offline or cancel work.
+      if (!clusterWasCurrentOwner) return
+
       pool.query(
         `UPDATE rmm_agent_devices SET websocket_status='Disconnected',websocket_disconnected_at=now(),updated_at=now() WHERE id=$1`,
         [agent.id],
