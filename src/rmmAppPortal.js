@@ -5,7 +5,7 @@ import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { hasPermission } from './access.js'
-import { originMatchesTenant } from './deploymentConfig.js'
+import { deployment, originMatchesTenant } from './deploymentConfig.js'
 import { pool, withTransaction } from './db.js'
 import { agentSocketForDevice, authenticateAgent, sendAgentMessage } from './rmmAgent.js'
 import { recordRmmActivity } from './rmmActivity.js'
@@ -291,7 +291,7 @@ async function dispatchCustomInstall(agent, app, identity) {
         (tenant_id,revision_id,agent_device_id,token_hash,expires_at)
        VALUES ($1,$2,$3,$4,now()+interval '15 minutes')`,
       [agent.tenant_id, app.revision_id, agent.id, packageTokenHash(token)])
-    downloadUrl = 'https://api.hi5central.com/api/v1/agent/app-portal/packages/' + token
+    downloadUrl = `${String(deployment.apiUrl || `https://api.${deployment.rootDomain}`).replace(/\/$/, '')}/api/v1/agent/app-portal/packages/${token}`
   }
   if (!validHttps(downloadUrl)) return { error: 'Application download URL is invalid.', status: 409 }
 
