@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS rmm_agent_jobs_vendor_artifact_probe_idx;

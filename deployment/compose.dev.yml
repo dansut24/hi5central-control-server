@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: hi5central
+      POSTGRES_USER: hi5central
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hi5central -d hi5central"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build: ..
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://hi5central:${POSTGRES_PASSWORD}@postgres:5432/hi5central
+    command: ["npm", "run", "migrate"]
+    restart: "no"
+
+  control-server:
+    build: ..
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://hi5central:${POSTGRES_PASSWORD}@postgres:5432/hi5central
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY is required}
+      RMM_RECOVERY_KEY_ENCRYPTION_KEY: ${RMM_RECOVERY_KEY_ENCRYPTION_KEY:?RMM_RECOVERY_KEY_ENCRYPTION_KEY is required}
+      COOKIE_DOMAIN: ""
+      DEPLOYMENT_MODE: self_hosted
+      TENANCY_MODE: single
+      ROOT_DOMAIN: localhost
+      PRIMARY_TENANT_SLUG: local
+      APP_URL: http://localhost:3000
+      API_URL: http://localhost:3001
+      PORTAL_URL: http://localhost:3000/portal
+      RMM_URL: http://localhost:3000/rmm
+      MARKETING_URL: http://localhost:3000
+      DOWNLOADS_URL: http://localhost:3000/downloads
+      TURN_URL: ""
+    ports:
+      - "3001:3001"
+
+volumes:
+  postgres_data:

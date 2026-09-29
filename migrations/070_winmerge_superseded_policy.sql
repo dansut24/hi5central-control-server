@@ -1,0 +1,1 @@
+UPDATE rmm_software_catalogue SET source_metadata = COALESCE(source_metadata,'{}'::jsonb) || '{"sideBySidePolicy":"replace"}'::jsonb, updated_at=now() WHERE canonical_name='WinMerge' AND status='active';
