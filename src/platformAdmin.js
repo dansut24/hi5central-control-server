@@ -138,7 +138,7 @@ function qualificationTiming(row) {
 function originAllowed(c) {
   const origin = clean(c.req.header('origin')).toLowerCase()
   if (!origin || process.env.NODE_ENV !== 'production') return true
-  return origin === `https://admin.${deployment.rootDomain}`
+  return origin === String(deployment.adminUrl || `https://admin.${deployment.rootDomain}`).toLowerCase()
 }
 function cookieOptions(extra = {}) {
   return { secure: true, httpOnly: true, sameSite: 'Lax', path: '/api/platform', ...extra }
