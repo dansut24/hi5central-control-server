@@ -9,7 +9,7 @@ import { enforceWorkspacePermissions } from './accessGate.js'
 import { registerCatalogueRoutes } from './catalogue.js'
 import { registerLicensingRoutes } from './licensing.js'
 import { registerMicrosoftRoutes, startMicrosoftSyncScheduler } from './microsoftIntegration.js'
-import { attachRmmAgentWebSocket, registerRmmAgentRoutes } from './rmmAgent.js'
+import { attachRmmAgentWebSocket, initializeAgentBroker, registerRmmAgentRoutes, shutdownAgentBroker } from './rmmAgent.js'
 import { registerRmmAutomationRoutes } from './rmmAutomation.js'
 import { registerRmmActivityRoutes } from './rmmActivity.js'
 import { attachRmmDeviceToolWebSocket, registerRmmDeviceToolRoutes } from './rmmDeviceTools.js'
@@ -419,6 +419,7 @@ app.onError((error, c) => {
 
 await pool.query('SELECT 1')
 await ensureRedisConnected()
+await initializeAgentBroker()
 if (backgroundWorkersEnabled) {
   startMicrosoftSyncScheduler()
   startRmmVulnerabilitySyncScheduler()
@@ -440,6 +441,7 @@ async function shutdown(signal) {
   console.log(`Received ${signal}; shutting down`)
   server.close(async () => {
     try {
+      await shutdownAgentBroker().catch((error) => console.error('RMM Agent broker shutdown failed', error))
       if (redis.isOpen) await redis.quit()
       await pool.end()
     } finally {
