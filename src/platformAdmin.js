@@ -259,6 +259,24 @@ function releaseChangePayload(row, results = {}) {
   }
 }
 
+
+function tenantReleasePreferencePayload(row) {
+  return {
+    tenantId: row.tenant_id,
+    slug: row.slug,
+    companyName: row.company_name,
+    updateMode: row.update_mode || 'admin_controlled',
+    managedByHi5Central: row.update_mode === 'hi5_managed',
+    testAutoSync: row.test_auto_sync == null ? true : Boolean(row.test_auto_sync),
+    uatAutoStage: Boolean(row.uat_auto_stage),
+    liveAutoPromote: Boolean(row.live_auto_promote),
+    liveDelayHours: Number(row.live_delay_hours ?? 24),
+    allowEmergencySecurityUpdates: row.allow_emergency_security_updates == null ? true : Boolean(row.allow_emergency_security_updates),
+    maintenanceWindow: object(row.maintenance_window),
+    updatedAt: row.release_updated_at || row.updated_at || null,
+  }
+}
+
 function environmentStatePayload(row) {
   return {
     environment: row.environment,
@@ -280,11 +298,20 @@ const RELEASE_EDITABLE_STATES = new Set([
   'draft','ready_for_test','testing','ready_for_uat','uat_testing','uat_passed','uat_failed','withdrawn',
 ])
 
-async function releaseOverview() {
-  const [environments, features, flags, changes, latestResults, promotions, actions] = await Promise.all([
+async function releaseOverview(tenantId = null) {
+  const [environments, features, flags, tenantFlags, tenants, changes, latestResults, promotions, actions] = await Promise.all([
     pool.query('SELECT * FROM platform_environment_state ORDER BY CASE environment WHEN \'dev\' THEN 1 WHEN \'test\' THEN 2 WHEN \'uat\' THEN 3 ELSE 4 END'),
     pool.query('SELECT * FROM platform_feature_definitions ORDER BY component,title'),
     pool.query('SELECT * FROM platform_environment_feature_flags ORDER BY environment,feature_key'),
+    tenantId
+      ? pool.query('SELECT * FROM tenant_environment_feature_overrides WHERE tenant_id=$1 ORDER BY environment,feature_key', [tenantId])
+      : Promise.resolve({ rows: [] }),
+    pool.query(`SELECT t.id AS tenant_id,t.slug,t.company_name,t.updated_at,
+      p.update_mode,p.test_auto_sync,p.uat_auto_stage,p.live_auto_promote,p.live_delay_hours,
+      p.allow_emergency_security_updates,p.maintenance_window,p.updated_at AS release_updated_at
+      FROM tenants t
+      LEFT JOIN tenant_release_preferences p ON p.tenant_id=t.id
+      ORDER BY t.company_name,t.slug`),
     pool.query('SELECT * FROM platform_release_changes ORDER BY created_at DESC LIMIT 300'),
     pool.query(`SELECT DISTINCT ON (change_id,environment)
       change_id,environment,result,notes,evidence,tested_by,created_at
@@ -313,9 +340,16 @@ async function releaseOverview() {
     if (!featureFlags[row.environment]) featureFlags[row.environment] = {}
     featureFlags[row.environment][row.feature_key] = Boolean(row.enabled)
   }
+  const tenantFeatureFlags = {}
+  for (const row of tenantFlags.rows) {
+    if (!tenantFeatureFlags[row.environment]) tenantFeatureFlags[row.environment] = {}
+    tenantFeatureFlags[row.environment][row.feature_key] = Boolean(row.enabled)
+  }
   return {
     currentEnvironment: deployment.runtimeEnvironment,
     currentFeatureMode: deployment.featureMode,
+    selectedTenantId: tenantId,
+    tenants: tenants.rows.map(tenantReleasePreferencePayload),
     environments: environments.rows.map(environmentStatePayload),
     features: features.rows.map((row) => ({
       key: row.feature_key,
@@ -328,7 +362,7 @@ async function releaseOverview() {
         environment,
         environment === 'dev' || environment === 'test'
           ? true
-          : Boolean(featureFlags[environment]?.[row.feature_key] ?? row.default_enabled),
+          : Boolean(tenantFeatureFlags[environment]?.[row.feature_key] ?? featureFlags[environment]?.[row.feature_key] ?? row.default_enabled),
       ])),
     })),
     changes: changes.rows.map((row) => releaseChangePayload(row, resultMap.get(row.id) || {})),
@@ -442,14 +476,13 @@ export function registerPlatformAdminRoutes(app) {
 
 
   app.get('/api/platform/v1/releases/overview', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c)
     if (auth.error) return auth.error
-    return c.json(await releaseOverview())
+    const tenantId = auth.session.tenant_id || clean(c.req.query('tenantId'), 80) || null
+    return c.json(await releaseOverview(tenantId))
   })
 
   app.post('/api/platform/v1/releases/features', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     let body
@@ -474,7 +507,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.patch('/api/platform/v1/releases/features/:featureKey/:environment', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const featureKey = clean(c.req.param('featureKey'), 120).toLowerCase()
@@ -487,19 +519,102 @@ export function registerPlatformAdminRoutes(app) {
     if (typeof body?.enabled !== 'boolean') return c.json({ error: 'enabled must be true or false.' }, 400)
     const feature = await pool.query('SELECT 1 FROM platform_feature_definitions WHERE feature_key=$1 AND status=\'active\'', [featureKey])
     if (!feature.rowCount) return c.json({ error: 'Feature not found.' }, 404)
-    await pool.query(
-      `INSERT INTO platform_environment_feature_flags (environment,feature_key,enabled,updated_by)
-       VALUES ($1,$2,$3,$4)
-       ON CONFLICT (environment,feature_key) DO UPDATE
-       SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=now()`,
-      [environment,featureKey,body.enabled,auth.session.user_id],
+    const tenantId = auth.session.tenant_id || clean(body?.tenantId, 80) || null
+    if (tenantId) {
+      const tenant = await pool.query('SELECT 1 FROM tenants WHERE id=$1', [tenantId])
+      if (!tenant.rowCount) return c.json({ error: 'Tenant not found.' }, 404)
+      await pool.query(
+        `INSERT INTO tenant_environment_feature_overrides (tenant_id,environment,feature_key,enabled,updated_by)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (tenant_id,environment,feature_key) DO UPDATE
+         SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=now()`,
+        [tenantId,environment,featureKey,body.enabled,auth.session.user_id],
+      )
+    } else {
+      await pool.query(
+        `INSERT INTO platform_environment_feature_flags (environment,feature_key,enabled,updated_by)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (environment,feature_key) DO UPDATE
+         SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=now()`,
+        [environment,featureKey,body.enabled,auth.session.user_id],
+      )
+    }
+    await audit(c, auth.session, 'release.feature.toggle', 'feature', featureKey, { environment, tenantId, enabled: body.enabled })
+    return c.json({ ok: true, environment, featureKey, tenantId, enabled: body.enabled })
+  })
+
+
+  app.patch('/api/platform/v1/releases/tenants/:tenantId/preferences', async (c) => {
+    const auth = await requireAdmin(c, WRITE_ROLES)
+    if (auth.error) return auth.error
+    const tenantId = auth.session.tenant_id || clean(c.req.param('tenantId'), 80)
+    if (!tenantId) return c.json({ error: 'Tenant is required.' }, 400)
+
+    const tenant = await pool.query('SELECT id,slug,company_name FROM tenants WHERE id=$1', [tenantId])
+    if (!tenant.rowCount) return c.json({ error: 'Tenant not found.' }, 404)
+
+    let body
+    try { body = await c.req.json() } catch {
+      return c.json({ error: 'A valid JSON request body is required.' }, 400)
+    }
+
+    const updateMode = clean(body?.updateMode, 40).toLowerCase()
+    if (!['admin_controlled','hi5_managed'].includes(updateMode)) {
+      return c.json({ error: 'updateMode must be admin_controlled or hi5_managed.' }, 400)
+    }
+    const delay = body?.liveDelayHours == null ? 24 : Math.floor(Number(body.liveDelayHours))
+    if (!Number.isFinite(delay) || delay < 0 || delay > 720) {
+      return c.json({ error: 'liveDelayHours must be between 0 and 720.' }, 400)
+    }
+    const managed = updateMode === 'hi5_managed'
+
+    const result = await pool.query(
+      `INSERT INTO tenant_release_preferences
+        (tenant_id,update_mode,test_auto_sync,uat_auto_stage,live_auto_promote,
+         live_delay_hours,allow_emergency_security_updates,maintenance_window,updated_by)
+       VALUES ($1,$2,true,$3,$3,$4,$5,$6::jsonb,$7)
+       ON CONFLICT (tenant_id) DO UPDATE SET
+         update_mode=EXCLUDED.update_mode,
+         test_auto_sync=true,
+         uat_auto_stage=EXCLUDED.uat_auto_stage,
+         live_auto_promote=EXCLUDED.live_auto_promote,
+         live_delay_hours=EXCLUDED.live_delay_hours,
+         allow_emergency_security_updates=EXCLUDED.allow_emergency_security_updates,
+         maintenance_window=CASE
+           WHEN EXCLUDED.maintenance_window='{}'::jsonb THEN tenant_release_preferences.maintenance_window
+           ELSE EXCLUDED.maintenance_window
+         END,
+         updated_by=EXCLUDED.updated_by,
+         updated_at=now()
+       RETURNING *`,
+      [
+        tenantId,
+        updateMode,
+        managed,
+        delay,
+        body?.allowEmergencySecurityUpdates !== false,
+        JSON.stringify(object(body?.maintenanceWindow)),
+        auth.session.user_id,
+      ],
     )
-    await audit(c, auth.session, 'release.feature.toggle', 'feature', featureKey, { environment, enabled: body.enabled })
-    return c.json({ ok: true, environment, featureKey, enabled: body.enabled })
+
+    await audit(c, auth.session, 'release.tenant_preferences.updated', 'tenant', tenantId, {
+      updateMode,
+      liveDelayHours: delay,
+      allowEmergencySecurityUpdates: body?.allowEmergencySecurityUpdates !== false,
+    })
+
+    return c.json({
+      preference: tenantReleasePreferencePayload({
+        ...result.rows[0],
+        slug: tenant.rows[0].slug,
+        company_name: tenant.rows[0].company_name,
+        release_updated_at: result.rows[0].updated_at,
+      }),
+    })
   })
 
   app.post('/api/platform/v1/releases/changes', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     let body
@@ -539,7 +654,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.patch('/api/platform/v1/releases/changes/:id', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const id = clean(c.req.param('id'), 80)
@@ -573,7 +687,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.post('/api/platform/v1/releases/changes/:id/test-results', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const id = clean(c.req.param('id'), 80)
@@ -611,7 +724,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.post('/api/platform/v1/releases/changes/:id/select-live', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const id = clean(c.req.param('id'), 80)
@@ -636,7 +748,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.post('/api/platform/v1/releases/changes/:id/unselect-live', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const id = clean(c.req.param('id'), 80)
@@ -650,7 +761,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.post('/api/platform/v1/releases/promotions', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     let body
@@ -701,7 +811,6 @@ export function registerPlatformAdminRoutes(app) {
   })
 
   app.post('/api/platform/v1/releases/environments/test/reset', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
     const auth = await requireAdmin(c, WRITE_ROLES)
     if (auth.error) return auth.error
     const state = await pool.query("SELECT * FROM platform_environment_state WHERE environment='test' AND disposable=true")
