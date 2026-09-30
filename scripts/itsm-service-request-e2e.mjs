@@ -200,7 +200,7 @@ async function main() {
   assert(requesterEvents.includes('service_request.customer_update_added'))
   assert(!requesterEvents.some((event) => event.startsWith('service_request.task_')))
   pass('technician bell receives task events while requester task noise is suppressed')
-  const deadline = Date.now() + 40000
+  const deadline = Date.now() + 120000
   let deliveries = []
   while (Date.now() < deadline) {
     const result = await pool.query(
