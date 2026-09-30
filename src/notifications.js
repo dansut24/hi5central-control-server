@@ -67,7 +67,18 @@ function normalisePreferences(input = {}, fallback = DEFAULT_PREFERENCES) {
 
 function mergePreferences(tenant, user) {
   const tenantPrefs = normalisePreferences(tenant || {})
-  return normalisePreferences(user || {}, tenantPrefs)
+  const merged = normalisePreferences(user || {}, tenantPrefs)
+  return {
+    channels: Object.fromEntries(
+      Object.keys(DEFAULT_PREFERENCES.channels).map((key) => [key, tenantPrefs.channels[key] !== false && merged.channels[key] !== false]),
+    ),
+    categories: Object.fromEntries(
+      Object.keys(DEFAULT_PREFERENCES.categories).map((key) => [key, tenantPrefs.categories[key] !== false && merged.categories[key] !== false]),
+    ),
+    requesterEvents: Object.fromEntries(
+      Object.keys(DEFAULT_PREFERENCES.requesterEvents).map((key) => [key, tenantPrefs.requesterEvents[key] !== false && merged.requesterEvents[key] !== false]),
+    ),
+  }
 }
 
 function categoryForEvent(eventType = '') {
