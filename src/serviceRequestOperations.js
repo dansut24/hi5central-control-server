@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
+import { attachmentPolicyFor } from './itsmConfig.js'
 
 const priorities = new Set(['Low', 'Medium', 'High', 'Critical'])
 const taskStatuses = new Set(['Waiting', 'Ready', 'In Progress', 'Completed', 'Blocked'])
@@ -469,8 +470,11 @@ export function registerServiceRequestOperationRoutes(app) {
     let content
     try { content = Buffer.from(encoded, 'base64') } catch { return c.json({ error: 'Attachment content is invalid.' }, 400) }
     if (!content.length) return c.json({ error: 'Choose a non-empty file.' }, 400)
-    if (content.length > 5 * 1024 * 1024) return c.json({ error: 'Attachments are limited to 5 MB each.' }, 413)
+    const attachmentPolicy = await attachmentPolicyFor(auth.session.tenant_id)
+    if (auth.session.tenant_role === 'requester' && !attachmentPolicy.requesterUploads) return c.json({ error: 'Requester uploads are disabled by tenant policy.' }, 403)
     const visibility = auth.session.tenant_role === 'requester' ? 'customer' : (body?.visibility === 'customer' ? 'customer' : 'internal')
+    if (visibility === 'internal' && !attachmentPolicy.internalAttachments) return c.json({ error: 'Internal attachments are disabled by tenant policy.' }, 403)
+    if (content.length > attachmentPolicy.maxBytes) return c.json({ error: `Attachments are limited to ${attachmentPolicy.maxMb} MB each.` }, 413)
     const sha256 = createHash('sha256').update(content).digest('hex')
 
     const result = await withTransaction(async (client) => {
