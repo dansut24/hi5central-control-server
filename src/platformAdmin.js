@@ -260,6 +260,24 @@ function releaseChangePayload(row, results = {}) {
 }
 
 
+
+function platformReleasePreferencePayload(row) {
+  return {
+    updateMode: row?.update_mode || (deployment.deploymentMode === 'managed' ? 'hi5_managed' : 'admin_controlled'),
+    managedByHi5Central: (row?.update_mode || (deployment.deploymentMode === 'managed' ? 'hi5_managed' : 'admin_controlled')) === 'hi5_managed',
+    releaseChannel: row?.release_channel || 'stable',
+    testAutoSync: row?.test_auto_sync == null ? true : Boolean(row.test_auto_sync),
+    uatAutoStage: Boolean(row?.uat_auto_stage),
+    liveAutoPromote: Boolean(row?.live_auto_promote),
+    liveDelayHours: Number(row?.live_delay_hours ?? 24),
+    allowEmergencySecurityUpdates: row?.allow_emergency_security_updates == null ? true : Boolean(row.allow_emergency_security_updates),
+    maintenanceWindow: object(row?.maintenance_window),
+    lastFeedSyncAt: row?.last_feed_sync_at || null,
+    lastReleaseSeen: row?.last_release_seen || '',
+    updatedAt: row?.updated_at || null,
+  }
+}
+
 function tenantReleasePreferencePayload(row) {
   return {
     tenantId: row.tenant_id,
@@ -299,8 +317,9 @@ const RELEASE_EDITABLE_STATES = new Set([
 ])
 
 async function releaseOverview(tenantId = null) {
-  const [environments, features, flags, tenantFlags, tenants, changes, latestResults, promotions, actions] = await Promise.all([
+  const [environments, deploymentPreference, features, flags, tenantFlags, tenants, changes, latestResults, promotions, actions] = await Promise.all([
     pool.query('SELECT * FROM platform_environment_state ORDER BY CASE environment WHEN \'dev\' THEN 1 WHEN \'test\' THEN 2 WHEN \'uat\' THEN 3 ELSE 4 END'),
+    pool.query("SELECT * FROM platform_release_preferences WHERE preference_key='deployment' LIMIT 1"),
     pool.query('SELECT * FROM platform_feature_definitions ORDER BY component,title'),
     pool.query('SELECT * FROM platform_environment_feature_flags ORDER BY environment,feature_key'),
     tenantId
@@ -348,6 +367,7 @@ async function releaseOverview(tenantId = null) {
   return {
     currentEnvironment: deployment.runtimeEnvironment,
     currentFeatureMode: deployment.featureMode,
+    deploymentPolicy: platformReleasePreferencePayload(deploymentPreference.rows[0]),
     selectedTenantId: tenantId,
     tenants: tenants.rows.map(tenantReleasePreferencePayload),
     environments: environments.rows.map(environmentStatePayload),
@@ -543,6 +563,69 @@ export function registerPlatformAdminRoutes(app) {
     return c.json({ ok: true, environment, featureKey, tenantId, enabled: body.enabled })
   })
 
+
+
+  app.patch('/api/platform/v1/releases/deployment/preferences', async (c) => {
+    const auth = await requireAdmin(c, WRITE_ROLES)
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch {
+      return c.json({ error: 'A valid JSON request body is required.' }, 400)
+    }
+
+    const updateMode = clean(body?.updateMode, 40).toLowerCase()
+    if (!['admin_controlled','hi5_managed'].includes(updateMode)) {
+      return c.json({ error: 'updateMode must be admin_controlled or hi5_managed.' }, 400)
+    }
+    const releaseChannel = clean(body?.releaseChannel, 20).toLowerCase() || 'stable'
+    if (!['stable','preview'].includes(releaseChannel)) {
+      return c.json({ error: 'releaseChannel must be stable or preview.' }, 400)
+    }
+    const delay = body?.liveDelayHours == null ? 24 : Math.floor(Number(body.liveDelayHours))
+    if (!Number.isFinite(delay) || delay < 0 || delay > 720) {
+      return c.json({ error: 'liveDelayHours must be between 0 and 720.' }, 400)
+    }
+    const managed = updateMode === 'hi5_managed'
+
+    const result = await pool.query(
+      `INSERT INTO platform_release_preferences
+        (preference_key,update_mode,release_channel,test_auto_sync,uat_auto_stage,live_auto_promote,
+         live_delay_hours,allow_emergency_security_updates,maintenance_window,updated_by)
+       VALUES ('deployment',$1,$2,true,$3,$3,$4,$5,$6::jsonb,$7)
+       ON CONFLICT (preference_key) DO UPDATE SET
+         update_mode=EXCLUDED.update_mode,
+         release_channel=EXCLUDED.release_channel,
+         test_auto_sync=true,
+         uat_auto_stage=EXCLUDED.uat_auto_stage,
+         live_auto_promote=EXCLUDED.live_auto_promote,
+         live_delay_hours=EXCLUDED.live_delay_hours,
+         allow_emergency_security_updates=EXCLUDED.allow_emergency_security_updates,
+         maintenance_window=CASE
+           WHEN EXCLUDED.maintenance_window='{}'::jsonb THEN platform_release_preferences.maintenance_window
+           ELSE EXCLUDED.maintenance_window
+         END,
+         updated_by=EXCLUDED.updated_by,
+         updated_at=now()
+       RETURNING *`,
+      [
+        updateMode,
+        releaseChannel,
+        managed,
+        delay,
+        body?.allowEmergencySecurityUpdates !== false,
+        JSON.stringify(object(body?.maintenanceWindow)),
+        auth.session.user_id,
+      ],
+    )
+
+    await audit(c, auth.session, 'release.deployment_preferences.updated', 'deployment', 'release', {
+      updateMode,
+      releaseChannel,
+      liveDelayHours: delay,
+      allowEmergencySecurityUpdates: body?.allowEmergencySecurityUpdates !== false,
+    })
+    return c.json({ preference: platformReleasePreferencePayload(result.rows[0]) })
+  })
 
   app.patch('/api/platform/v1/releases/tenants/:tenantId/preferences', async (c) => {
     const auth = await requireAdmin(c, WRITE_ROLES)
