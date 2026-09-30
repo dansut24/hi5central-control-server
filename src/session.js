@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
-import { attachAccess, effectiveAccessForUser } from './access.js'
+import { attachAccess, effectiveAccessForUser, expandedPermissions } from './access.js'
 import { deployment, portalRequestFromHeaders } from './deploymentConfig.js'
 import { pool } from './db.js'
 import { mfaRequiredFor, sessionNeedsMfa, sessionTtlSeconds } from './securityPolicy.js'
@@ -11,6 +11,52 @@ const DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 12
 
 function hashToken(token) {
   return createHash('sha256').update(token).digest('hex')
+}
+
+function bearerToken(c) {
+  const authorization = String(c.req.header('authorization') || '').trim()
+  const match = authorization.match(/^Bearer\s+(.+)$/i)
+  return match ? match[1].trim() : ''
+}
+
+async function resolveApiToken(c, token) {
+  if (!token || !token.startsWith('hi5_pat_')) return null
+  const tokenHash = hashToken(token)
+  const result = await pool.query(
+    `SELECT at.id AS api_token_id,at.tenant_id,at.user_id,at.scopes AS api_token_scopes,at.expires_at,
+            t.slug,t.company_name,t.status AS tenant_status,u.email,u.name,m.role AS tenant_role,m.status AS membership_status,
+            ts.modules,ts.onboarding_step,ts.onboarding_completed_at,ts.onboarding_data,ts.configuration,ts.tenant_url,ts.portal_url,ts.rmm_url,
+            up.preferences AS user_preferences
+     FROM api_tokens at
+     JOIN tenants t ON t.id=at.tenant_id
+     JOIN users u ON u.id=at.user_id
+     JOIN tenant_memberships m ON m.tenant_id=at.tenant_id AND m.user_id=at.user_id
+     JOIN tenant_settings ts ON ts.tenant_id=at.tenant_id
+     LEFT JOIN user_preferences up ON up.tenant_id=at.tenant_id AND up.user_id=at.user_id
+     WHERE at.token_hash=$1 AND at.revoked_at IS NULL AND (at.expires_at IS NULL OR at.expires_at>now())
+     LIMIT 1`,
+    [tokenHash],
+  )
+  if (!result.rowCount) return null
+  const row = result.rows[0]
+  if (row.tenant_status !== 'active' || row.membership_status !== 'active') return null
+
+  const fullAccess = await effectiveAccessForUser(pool, row.tenant_id, row.user_id, row.tenant_role)
+  const currentlyAllowed = new Set(expandedPermissions(fullAccess))
+  const tokenScopes = (Array.isArray(row.api_token_scopes) ? row.api_token_scopes : [])
+    .filter((scope) => currentlyAllowed.has(scope))
+  const access = {
+    ...fullAccess,
+    permissions: tokenScopes,
+    effectivePermissions: tokenScopes,
+    workspaceAccess: tokenScopes.includes('workspace.access'),
+    portalAccess: false,
+  }
+  if (!access.workspaceAccess) return null
+
+  const resolved = attachAccess({ ...row, authentication_type: 'api_token' }, access, 'workspace')
+  pool.query('UPDATE api_tokens SET last_used_at=now(),updated_at=now() WHERE id=$1', [row.api_token_id]).catch(() => {})
+  return resolved
 }
 
 function portalRequest(c) {
@@ -111,6 +157,9 @@ export function clearSessionCookie(c) { deleteNamedCookie(c, COOKIE_NAME) }
 export function clearPortalSessionCookie(c) { deleteNamedCookie(c, PORTAL_COOKIE_NAME) }
 
 export async function resolveSession(c) {
+  const apiToken = bearerToken(c)
+  if (apiToken) return resolveApiToken(c, apiToken)
+
   const token = getCookie(c, requestCookieName(c))
   if (!token) return null
   const tokenHash = hashToken(token)
@@ -146,6 +195,11 @@ export async function resolveSession(c) {
 }
 
 export async function revokeCurrentSession(c) {
+  const apiToken = bearerToken(c)
+  if (apiToken) {
+    await pool.query('UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()),updated_at=now() WHERE token_hash=$1', [hashToken(apiToken)])
+    return
+  }
   const cookieName = requestCookieName(c)
   const token = getCookie(c, cookieName)
   if (token) await pool.query('UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE token_hash=$1', [hashToken(token)])
@@ -183,6 +237,9 @@ export function sessionPayload(session) {
     },
     onboarding: { step: session.onboarding_step, completedAt: session.onboarding_completed_at, data: session.onboarding_data || {} },
     security: { mfaVerified: Boolean(session.mfa_verified_at) },
+    authentication: session.api_token_id
+      ? { type: 'api_token', tokenId: session.api_token_id }
+      : { type: 'session' },
     preferences: session.user_preferences || null,
     settings: configuration,
   }

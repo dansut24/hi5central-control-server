@@ -5,9 +5,11 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { secureHeaders } from 'hono/secure-headers'
 import { attachAccess, effectiveAccessForUser } from './access.js'
+import { registerApiTokenRoutes } from './apiTokens.js'
 import { enforceWorkspacePermissions } from './accessGate.js'
 import { registerCatalogueRoutes } from './catalogue.js'
-import { registerLicensingRoutes } from './licensing.js'
+import { featureEntitled, registerLicensingRoutes, startLicensingRefreshScheduler } from './licensing.js'
+import { registerLicenseAuthorityRoutes } from './licenseAuthority.js'
 import { registerMicrosoftRoutes, startMicrosoftSyncScheduler } from './microsoftIntegration.js'
 import { attachRmmAgentWebSocket, initializeAgentBroker, registerRmmAgentRoutes, shutdownAgentBroker } from './rmmAgent.js'
 import { registerRmmAutomationRoutes } from './rmmAutomation.js'
@@ -156,6 +158,24 @@ app.get('/api/v1/system/smtp-health', async (c) => {
     return c.json({ status: 'error', smtp: 'error' }, 503)
   }
 })
+
+app.get('/api/v1/system/capabilities', (c) => c.json({
+  api: { framework: 'Hono', version: 'v1', apiFirst: true },
+  authentication: {
+    browser: 'session_cookie',
+    integrations: 'bearer_api_token',
+    apiTokenEndpoint: '/api/v1/integrations/api-tokens',
+  },
+  documentation: {
+    openapi: '/api/v1/openapi.json',
+    routes: '/api/v1/system/routes',
+  },
+  deployment: {
+    mode: deployment.deploymentMode,
+    edition: deployment.selfHostEdition,
+    tenancy: deployment.tenancyMode,
+  },
+}))
 
 app.get('/api/v1/auth/tenant-slug/:slug', async (c) => {
   const slug = normaliseSlug(c.req.param('slug'))
@@ -393,8 +413,21 @@ app.post('/api/v1/onboarding/complete', async (c) => {
   return c.json(sessionPayload(refreshed))
 })
 
+app.use('/api/platform/v1/*', async (c, next) => {
+  if (deployment.deploymentMode === 'managed') return next()
+  if (deployment.selfHostEdition === 'standard') {
+    return c.json({ error: 'Platform Admin is not included in the Standard self-host edition.', code: 'FEATURE_NOT_AVAILABLE' }, 404)
+  }
+  if (!await featureEntitled('platformAdmin')) {
+    return c.json({ error: 'A valid Hi5Central MSP licence is required.', code: 'FEATURE_NOT_ENTITLED' }, 403)
+  }
+  return next()
+})
+
 registerPlatformAdminRoutes(app)
+registerLicenseAuthorityRoutes(app)
 registerLicensingRoutes(app)
+registerApiTokenRoutes(app)
 registerCatalogueRoutes(app)
 registerOrganisationRoutes(app)
 registerSettingsRoutes(app)
@@ -422,6 +455,7 @@ app.onError((error, c) => {
 await pool.query('SELECT 1')
 await ensureRedisConnected()
 await initializeAgentBroker()
+startLicensingRefreshScheduler()
 if (backgroundWorkersEnabled) {
   startMicrosoftSyncScheduler()
   startRmmVulnerabilitySyncScheduler()

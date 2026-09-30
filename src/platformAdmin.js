@@ -20,6 +20,7 @@ import {
 } from './rmmSoftwareQualification.js'
 import { ensureDefaultRoles } from './access.js'
 import { sendTenantOwnerTransferApprovalEmail } from './mailer.js'
+import { issueMspLicense } from './licenseAuthority.js'
 import { wingetRepositorySearch } from './rmmWingetFallback.js'
 import { syncSoftwareVendorSource } from './rmmSoftwareVendorIntel.js'
 
@@ -191,6 +192,38 @@ function adminPayload(session) {
   return { authenticated: true, user: { id: session.user_id, name: session.name, email: session.email, role: session.role } }
 }
 
+function mspLicensePayload(row) {
+  return {
+    id: row.id,
+    customerName: row.customer_name,
+    status: row.status,
+    keySuffix: row.display_key_suffix,
+    products: row.products || [],
+    features: row.features || {},
+    limits: {
+      tenants: row.tenant_limit == null ? null : Number(row.tenant_limit),
+      users: row.user_limit == null ? null : Number(row.user_limit),
+      devices: row.device_limit == null ? null : Number(row.device_limit),
+    },
+    startsAt: row.starts_at,
+    expiresAt: row.expires_at,
+    graceDays: Number(row.grace_days || 0),
+    boundInstallationId: row.bound_installation_id,
+    boundAt: row.bound_at,
+    lastActivatedAt: row.last_activated_at,
+    lastRefreshedAt: row.last_refreshed_at,
+    notes: row.notes || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function nullablePositiveInteger(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Math.floor(Number(value))
+  return Number.isFinite(number) && number >= 1 ? number : null
+}
+
 export function registerPlatformAdminRoutes(app) {
   app.post('/api/platform/v1/auth/login', async (c) => {
     if (!originAllowed(c)) return c.json({ error: 'Admin origin required.' }, 403)
@@ -265,6 +298,127 @@ export function registerPlatformAdminRoutes(app) {
       qualification: qualification.rows[0],
       runners: runners.rows[0],
     })
+  })
+
+  app.get('/api/platform/v1/licenses', async (c) => {
+    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    const auth = await requireAdmin(c, BILLING_ROLES)
+    if (auth.error) return auth.error
+    const result = await pool.query(
+      `SELECT id,customer_name,status,display_key_suffix,products,features,
+              tenant_limit,user_limit,device_limit,starts_at,expires_at,grace_days,
+              bound_installation_id,bound_at,last_activated_at,last_refreshed_at,
+              notes,created_at,updated_at
+         FROM msp_licenses
+        ORDER BY created_at DESC`,
+    )
+    return c.json({ items: result.rows.map(mspLicensePayload) })
+  })
+
+  app.post('/api/platform/v1/licenses', async (c) => {
+    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    const auth = await requireAdmin(c, BILLING_ROLES)
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+    try {
+      const issued = await issueMspLicense(body || {})
+      await audit(c, auth.session, 'msp_license.created', 'msp_license', issued.license.id, {
+        customerName: issued.license.customer_name,
+        expiresAt: issued.license.expires_at,
+      })
+      return c.json({
+        licenseKey: issued.licenseKey,
+        license: mspLicensePayload(issued.license),
+        notice: 'The licence key is returned once. Store and send it securely.',
+      }, 201)
+    } catch (error) {
+      return c.json({ error: error?.message || 'Unable to issue MSP licence.' }, Number(error?.status) || 400)
+    }
+  })
+
+  app.patch('/api/platform/v1/licenses/:id', async (c) => {
+    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    const auth = await requireAdmin(c, BILLING_ROLES)
+    if (auth.error) return auth.error
+    const id = clean(c.req.param('id'), 80)
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+
+    const existing = await pool.query('SELECT * FROM msp_licenses WHERE id=$1 LIMIT 1', [id])
+    if (!existing.rowCount) return c.json({ error: 'MSP licence not found.' }, 404)
+    const current = existing.rows[0]
+
+    const status = Object.hasOwn(body, 'status') ? clean(body.status, 20) : current.status
+    if (!['active','suspended','cancelled'].includes(status)) {
+      return c.json({ error: 'status must be active, suspended or cancelled.' }, 400)
+    }
+
+    let expiresAt = current.expires_at
+    if (Object.hasOwn(body, 'expiresAt')) {
+      expiresAt = body.expiresAt ? new Date(body.expiresAt) : null
+      if (expiresAt && Number.isNaN(expiresAt.getTime())) return c.json({ error: 'expiresAt is invalid.' }, 400)
+    }
+    const graceDays = Object.hasOwn(body, 'graceDays')
+      ? Math.max(0, Math.min(90, Math.floor(Number(body.graceDays) || 0)))
+      : Number(current.grace_days || 0)
+    const features = Object.hasOwn(body, 'features')
+      ? { ...object(current.features), ...object(body.features) }
+      : object(current.features)
+
+    const readLimit = (key, currentValue) => {
+      if (!Object.hasOwn(body, key)) return currentValue
+      if (body[key] === null || body[key] === '') return null
+      return nullablePositiveInteger(body[key])
+    }
+    const tenantLimit = readLimit('tenantLimit', current.tenant_limit)
+    const userLimit = readLimit('userLimit', current.user_limit)
+    const deviceLimit = readLimit('deviceLimit', current.device_limit)
+    for (const [key, value] of [['tenantLimit',tenantLimit],['userLimit',userLimit],['deviceLimit',deviceLimit]]) {
+      if (Object.hasOwn(body, key) && body[key] !== null && body[key] !== '' && value === null) {
+        return c.json({ error: `${key} must be a positive integer or null.` }, 400)
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE msp_licenses
+          SET customer_name=$2,status=$3,features=$4::jsonb,
+              tenant_limit=$5,user_limit=$6,device_limit=$7,
+              expires_at=$8,grace_days=$9,notes=$10,updated_at=now()
+        WHERE id=$1
+        RETURNING *`,
+      [
+        id,
+        Object.hasOwn(body, 'customerName') ? clean(body.customerName, 180) : current.customer_name,
+        status,
+        JSON.stringify(features),
+        tenantLimit,
+        userLimit,
+        deviceLimit,
+        expiresAt,
+        graceDays,
+        Object.hasOwn(body, 'notes') ? clean(body.notes, 4000) : current.notes,
+      ],
+    )
+    await audit(c, auth.session, 'msp_license.updated', 'msp_license', id, { fields: Object.keys(body || {}) })
+    return c.json({ license: mspLicensePayload(result.rows[0]) })
+  })
+
+  app.post('/api/platform/v1/licenses/:id/reset-binding', async (c) => {
+    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    const auth = await requireAdmin(c, WRITE_ROLES)
+    if (auth.error) return auth.error
+    const id = clean(c.req.param('id'), 80)
+    const result = await pool.query(
+      `UPDATE msp_licenses
+          SET bound_installation_id=NULL,bound_at=NULL,refresh_token_hash=NULL,updated_at=now()
+        WHERE id=$1
+        RETURNING *`,
+      [id],
+    )
+    if (!result.rowCount) return c.json({ error: 'MSP licence not found.' }, 404)
+    await audit(c, auth.session, 'msp_license.binding_reset', 'msp_license', id)
+    return c.json({ license: mspLicensePayload(result.rows[0]) })
   })
 
   app.get('/api/platform/v1/tenants', async (c) => {
