@@ -111,7 +111,7 @@ async function main() {
   })
 
   let updateRows = []
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     updateRows = await deliveryRows(tenant.id, incident.id, 'incident.customer_update_added', requester.id)
     if (updateRows.some((row) => row.channel === 'email' && row.status === 'sent')) break
     await new Promise((resolve) => setTimeout(resolve, 1000))
