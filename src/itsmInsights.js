@@ -3,7 +3,7 @@ import { originMatchesTenant } from './deploymentConfig.js'
 import { pool } from './db.js'
 import { resolveSession } from './session.js'
 
-const recordTypes = new Set(['Incident', 'Service Request', 'Problem', 'Change'])
+const recordTypes = new Set(['All', 'Incident', 'Service Request', 'Problem', 'Change'])
 function clean(value = '', max = 255) { return String(value ?? '').trim().slice(0, max) }
 function object(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {} }
 
