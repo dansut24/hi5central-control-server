@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
+import { hasPermission } from './access.js'
+import { hasRecordPermission } from './itsmPermissions.js'
 
 const priorities = new Set(['Low', 'Medium', 'High', 'Critical'])
 const impacts = new Set(['Low', 'Medium', 'High'])
@@ -377,6 +379,7 @@ export function registerItsmLifecycleRoutes(app) {
     if (auth.error) return auth.error
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'view')) return c.json({ error: 'You do not have permission to view this record.' }, 403)
     return c.json(await detailPayload(row, auth.session.tenant_id))
   })
 
@@ -391,6 +394,10 @@ export function registerItsmLifecycleRoutes(app) {
     const result = await withTransaction(async (client) => {
       const current = await lookupRecord(auth.session.tenant_id, c.req.param('reference'), client, true)
       if (!current) return { notFound: true }
+      if (!hasRecordPermission(auth.session, current.record_type, 'edit')) return { forbidden: 'edit' }
+      if ((Object.prototype.hasOwnProperty.call(body, 'team') || Object.prototype.hasOwnProperty.call(body, 'assignee')) && !hasRecordPermission(auth.session, current.record_type, 'assign')) return { forbidden: 'assign' }
+      const requestedStatus = Object.prototype.hasOwnProperty.call(body, 'status') ? text(body.status, 80) : current.status
+      if (requestedStatus !== current.status && ['Resolved', 'Closed', 'Completed', 'Cancelled'].includes(requestedStatus) && !hasRecordPermission(auth.session, current.record_type, 'resolve')) return { forbidden: 'resolve' }
       if (Number(current.version || 1) !== expectedVersion) return { conflict: true, current }
 
       const configuration = await configurationFor(auth.session.tenant_id, client)
@@ -549,6 +556,7 @@ export function registerItsmLifecycleRoutes(app) {
     })
 
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (result.forbidden) return c.json({ error: `You do not have permission to ${result.forbidden} this record.` }, 403)
     if (result.invalidStatus) return c.json({ error: 'That status is not valid for this record type.' }, 400)
     if (result.invalidRequester) return c.json({ error: 'Choose an active requester from this tenant.' }, 400)
     if (result.resolutionRequired) return c.json({ error: 'Add a resolution code and resolution summary before resolving or closing this Incident.' }, 400)
@@ -565,9 +573,11 @@ export function registerItsmLifecycleRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to update this record.' }, 403)
     const bodyText = text(body?.text, 20000)
     if (!bodyText) return c.json({ error: 'Add activity text first.' }, 400)
     const visibility = body?.visibility === 'customer' ? 'customer' : 'internal'
+    if (visibility === 'internal' && !hasPermission(auth.session.access, 'itsm.comments.internal')) return c.json({ error: 'You do not have permission to add internal work notes.' }, 403)
     const kind = visibility === 'customer' ? 'customer' : 'work'
     await withTransaction(async (client) => {
       await client.query(
@@ -596,6 +606,7 @@ export function registerItsmLifecycleRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to update relationships on this record.' }, 403)
     const targetReference = text(body?.targetReference, 80)
     if (!targetReference || targetReference.toUpperCase() === row.reference.toUpperCase()) return c.json({ error: 'Choose another record to link.' }, 400)
     const target = await relatedTarget(auth.session.tenant_id, targetReference)
@@ -629,6 +640,7 @@ export function registerItsmLifecycleRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to update relationships on this record.' }, 403)
     const relationshipId = text(body?.relationshipId, 80)
     await pool.query(
       `DELETE FROM itsm_record_relationships WHERE id = $1 AND tenant_id = $2 AND source_record_id = $3`,
@@ -646,6 +658,7 @@ export function registerItsmLifecycleRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to add attachments to this record.' }, 403)
     const fileName = safeFileName(body?.fileName)
     const mimeType = text(body?.mimeType || 'application/octet-stream', 180) || 'application/octet-stream'
     const encoded = String(body?.contentBase64 || '').replace(/^data:[^;]+;base64,/, '')
@@ -677,6 +690,7 @@ export function registerItsmLifecycleRoutes(app) {
     if (auth.error) return auth.error
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'view')) return c.json({ error: 'You do not have permission to view attachments on this record.' }, 403)
     const result = await pool.query(
       `SELECT file_name, mime_type, content
        FROM itsm_record_attachments
@@ -703,6 +717,7 @@ export function registerItsmLifecycleRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to remove attachments from this record.' }, 403)
     await pool.query(
       `DELETE FROM itsm_record_attachments WHERE id = $1 AND tenant_id = $2 AND record_id = $3`,
       [text(body?.attachmentId, 80), auth.session.tenant_id, row.id],
