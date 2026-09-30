@@ -998,3 +998,147 @@ export function registerProjectRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const title = text(body?.title, 240)
     if (!title) return c.json({ error: 'Risk or issue title is required.' }, 400)
+
+    const result = await withTransaction(async (client) => {
+      const project = await projectFor(client, auth.session.tenant_id, c.req.param('reference'), true)
+      if (!project) return { notFound: true }
+      const kind = riskKinds.has(body?.kind) ? body.kind : 'Risk'
+      const severity = priorities.has(body?.severity) ? body.severity : 'Medium'
+      const status = riskStatuses.has(body?.status) ? body.status : 'Open'
+      const owner = body?.ownerId ? await activeTechnician(client, auth.session.tenant_id, body.ownerId) : null
+      if (body?.ownerId && !owner) return { invalidOwner: true }
+      const externalKey = await nextChildKey(client, 'project_risks', project, kind === 'Issue' ? 'I' : 'R')
+      await client.query(
+        `INSERT INTO project_risks(
+           tenant_id,project_id,external_key,kind,title,severity,status,response,owner_person_id,owner_snapshot,closed_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)`,
+        [
+          auth.session.tenant_id, project.id, externalKey, kind, title, severity, status,
+          text(body?.response, 12000), owner?.id || null, JSON.stringify(personSnapshot(owner)),
+          status === 'Closed' ? new Date() : null,
+        ],
+      )
+      if (owner) {
+        await client.query(
+          `INSERT INTO project_members(tenant_id,project_id,person_id,role)
+           VALUES($1,$2,$3,'Member') ON CONFLICT(project_id,person_id) DO NOTHING`,
+          [auth.session.tenant_id, project.id, owner.id],
+        )
+      }
+      await touchProject(client, project.id)
+      const actor = await actorContext(client, auth.session)
+      await addProjectActivity(client, {
+        session: auth.session, project, actor, kind: 'risk',
+        bodyText: `added ${kind.toLowerCase()} “${title}”`,
+        metadata: { event: 'project.risk_created', riskId: externalKey, severity },
+      })
+      return { project }
+    })
+    if (result.notFound) return c.json({ error: 'Project not found.' }, 404)
+    if (result.invalidOwner) return c.json({ error: 'Choose an active technician as owner.' }, 400)
+    const project = await projectFor(pool, auth.session.tenant_id, c.req.param('reference'))
+    return c.json(await payloadForProject(pool, project), 201)
+  })
+
+  app.patch('/api/v1/projects/:reference/risks/:riskKey', async (c) => {
+    const auth = await requireProjectPermission(c, 'projects.manage')
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+
+    const result = await withTransaction(async (client) => {
+      const project = await projectFor(client, auth.session.tenant_id, c.req.param('reference'), true)
+      if (!project) return { notFound: true }
+      const riskResult = await client.query(
+        'SELECT * FROM project_risks WHERE project_id=$1 AND external_key=$2 LIMIT 1 FOR UPDATE',
+        [project.id, text(c.req.param('riskKey'), 100)],
+      )
+      if (!riskResult.rowCount) return { riskNotFound: true }
+      const current = riskResult.rows[0]
+      const kind = Object.prototype.hasOwnProperty.call(body, 'kind') ? body.kind : current.kind
+      const severity = Object.prototype.hasOwnProperty.call(body, 'severity') ? body.severity : current.severity
+      const status = Object.prototype.hasOwnProperty.call(body, 'status') ? body.status : current.status
+      if (!riskKinds.has(kind)) return { invalidKind: true }
+      if (!priorities.has(severity)) return { invalidSeverity: true }
+      if (!riskStatuses.has(status)) return { invalidStatus: true }
+      let owner = await personFromSnapshotOrId(client, auth.session.tenant_id, current.owner_person_id, current.owner_snapshot)
+      if (Object.prototype.hasOwnProperty.call(body, 'ownerId')) {
+        owner = body.ownerId ? await activeTechnician(client, auth.session.tenant_id, body.ownerId) : null
+        if (body.ownerId && !owner) return { invalidOwner: true }
+      }
+      const title = Object.prototype.hasOwnProperty.call(body, 'title') ? text(body.title, 240) : current.title
+      if (!title) return { invalidTitle: true }
+      await client.query(
+        `UPDATE project_risks SET kind=$2,title=$3,severity=$4,status=$5,response=$6,
+         owner_person_id=$7,owner_snapshot=$8::jsonb,closed_at=$9,updated_at=now()
+         WHERE id=$1`,
+        [
+          current.id, kind, title, severity, status,
+          Object.prototype.hasOwnProperty.call(body, 'response') ? text(body.response, 12000) : current.response,
+          owner?.id || null, JSON.stringify(personSnapshot(owner)),
+          status === 'Closed' ? (current.closed_at || new Date()) : current.status === 'Closed' && status !== 'Closed' ? null : current.closed_at,
+        ],
+      )
+      await touchProject(client, project.id)
+      const actor = await actorContext(client, auth.session)
+      await addProjectActivity(client, {
+        session: auth.session, project, actor, kind: 'risk',
+        bodyText: `${status === 'Closed' && current.status !== 'Closed' ? 'closed' : 'updated'} ${kind.toLowerCase()} “${title}”`,
+        metadata: { event: 'project.risk_updated', riskId: current.external_key, status, severity },
+      })
+      return { project }
+    })
+    if (result.notFound) return c.json({ error: 'Project not found.' }, 404)
+    if (result.riskNotFound) return c.json({ error: 'Project risk or issue not found.' }, 404)
+    if (result.invalidKind) return c.json({ error: 'Unsupported risk type.' }, 400)
+    if (result.invalidSeverity) return c.json({ error: 'Unsupported risk severity.' }, 400)
+    if (result.invalidStatus) return c.json({ error: 'Unsupported risk status.' }, 400)
+    if (result.invalidOwner) return c.json({ error: 'Choose an active technician as owner.' }, 400)
+    if (result.invalidTitle) return c.json({ error: 'Risk or issue title is required.' }, 400)
+    const project = await projectFor(pool, auth.session.tenant_id, c.req.param('reference'))
+    return c.json(await payloadForProject(pool, project))
+  })
+
+  app.post('/api/v1/projects/:reference/activity', async (c) => {
+    const auth = await requireProjectPermission(c, 'projects.manage')
+    if (auth.error) return auth.error
+    let body
+    try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
+    const note = text(body?.text || body?.body, 20000)
+    if (!note) return c.json({ error: 'Project update text is required.' }, 400)
+
+    const result = await withTransaction(async (client) => {
+      const project = await projectFor(client, auth.session.tenant_id, c.req.param('reference'), true)
+      if (!project) return { notFound: true }
+      const actor = await actorContext(client, auth.session)
+      await addProjectActivity(client, {
+        session: auth.session, project, actor, kind: 'update', bodyText: note,
+        metadata: { event: 'project.update_added' },
+      })
+      await touchProject(client, project.id)
+      const eventId = await createDomainEvent(client, {
+        tenantId: auth.session.tenant_id,
+        eventType: 'project.update_added',
+        projectReference: project.reference,
+        actorUserId: auth.session.user_id,
+        payload: { text: note },
+      })
+      const owner = await personFromSnapshotOrId(client, auth.session.tenant_id, project.owner_person_id, project.owner_snapshot)
+      const sponsor = await personFromSnapshotOrId(client, auth.session.tenant_id, project.sponsor_person_id, project.sponsor_snapshot)
+      await notifyUniquePeople(client, {
+        tenantId: auth.session.tenant_id,
+        people: [owner, sponsor],
+        eventId,
+        eventType: 'project.update_added',
+        projectReference: project.reference,
+        title: `${project.reference} · project update`,
+        body: note,
+        metadata: { action: 'update_added' },
+      })
+      return { project }
+    })
+    if (result.notFound) return c.json({ error: 'Project not found.' }, 404)
+    const project = await projectFor(pool, auth.session.tenant_id, c.req.param('reference'))
+    return c.json(await payloadForProject(pool, project), 201)
+  })
+}
