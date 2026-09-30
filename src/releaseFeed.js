@@ -10,7 +10,7 @@ function pem(value) {
 function releasePrivateKeyPem() {
   const explicit = pem(process.env.RELEASE_SIGNING_PRIVATE_KEY_PEM)
   if (explicit) return explicit
-  if (deployment.deploymentMode === 'managed' && deployment.runtimeEnvironment !== 'live') {
+  if (deployment.deploymentMode === 'managed' && deployment.runtimeEnvironment === 'dev') {
     return pem(process.env.LICENSING_PRIVATE_KEY_PEM)
   }
   return ''
@@ -19,7 +19,7 @@ function releasePrivateKeyPem() {
 function releasePublicKeyPem() {
   const explicit = pem(process.env.RELEASE_SIGNING_PUBLIC_KEY_PEM)
   if (explicit) return explicit
-  if (deployment.deploymentMode === 'managed' && deployment.runtimeEnvironment !== 'live') {
+  if (deployment.deploymentMode === 'managed' && deployment.runtimeEnvironment === 'dev') {
     return pem(process.env.LICENSING_PUBLIC_KEY_PEM)
   }
   return ''
@@ -128,7 +128,7 @@ async function publishedRelease(channel) {
 
 export function registerReleaseFeedRoutes(app) {
   app.get('/api/releases/v1/public-key', (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    if (deployment.deploymentMode !== 'managed' || !['dev','live'].includes(deployment.runtimeEnvironment)) return c.json({ error: 'Not found.' }, 404)
     const publicKey = derivedPublicKeyPem()
     if (!publicKey) return c.json({ error: 'Release signing authority is not configured.' }, 503)
     return c.json({
@@ -139,7 +139,7 @@ export function registerReleaseFeedRoutes(app) {
   })
 
   app.get('/api/releases/v1/feed', async (c) => {
-    if (deployment.deploymentMode !== 'managed') return c.json({ error: 'Not found.' }, 404)
+    if (deployment.deploymentMode !== 'managed' || !['dev','live'].includes(deployment.runtimeEnvironment)) return c.json({ error: 'Not found.' }, 404)
     const channel = String(c.req.query('channel') || 'stable').trim().toLowerCase()
     if (!['stable','preview'].includes(channel)) return c.json({ error: 'channel must be stable or preview.' }, 400)
     const envelope = await publishedRelease(channel)
