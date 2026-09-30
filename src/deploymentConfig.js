@@ -46,6 +46,8 @@ export const deployment = Object.freeze((() => {
     ? enumValue(process.env.SELF_HOST_EDITION, ['standard', 'msp'], 'standard')
     : 'managed'
   const tenancyMode = enumValue(process.env.TENANCY_MODE, ['multi', 'single'], 'multi')
+  const runtimeEnvironment = enumValue(process.env.RUNTIME_ENVIRONMENT, ['dev', 'test', 'uat', 'live'], 'live')
+  const featureMode = enumValue(process.env.FEATURE_MODE, ['all_enabled', 'controlled'], runtimeEnvironment === 'dev' || runtimeEnvironment === 'test' ? 'all_enabled' : 'controlled')
   const rootDomain = cleanDomain(process.env.ROOT_DOMAIN, 'hi5central.com')
   const primaryTenantSlug = cleanSlug(process.env.PRIMARY_TENANT_SLUG)
   const defaultAppUrl = tenancyMode === 'single' ? `https://${rootDomain}` : ''
@@ -65,6 +67,8 @@ export const deployment = Object.freeze((() => {
     deploymentMode,
     selfHostEdition,
     tenancyMode,
+    runtimeEnvironment,
+    featureMode,
     rootDomain,
     primaryTenantSlug,
     appUrl,

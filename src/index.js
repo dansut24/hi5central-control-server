@@ -9,6 +9,7 @@ import { registerApiTokenRoutes } from './apiTokens.js'
 import { enforceWorkspacePermissions } from './accessGate.js'
 import { registerCatalogueRoutes } from './catalogue.js'
 import { featureEntitled, registerLicensingRoutes, startLicensingRefreshScheduler } from './licensing.js'
+import { registerFeatureFlagRoutes } from './featureFlags.js'
 import { registerLicenseAuthorityRoutes } from './licenseAuthority.js'
 import { registerMicrosoftRoutes, startMicrosoftSyncScheduler } from './microsoftIntegration.js'
 import { attachRmmAgentWebSocket, initializeAgentBroker, registerRmmAgentRoutes, shutdownAgentBroker } from './rmmAgent.js'
@@ -35,7 +36,9 @@ import {
 import { pool, withTransaction } from './db.js'
 import { sendVerificationEmail, verifySmtpConnection } from './mailer.js'
 import { registerOrganisationRoutes } from './organisation.js'
+import { buildOpenApiDocument } from './openapi.js'
 import { registerPlatformAdminRoutes } from './platformAdmin.js'
+import { registerReleaseOperatorRoutes } from './releaseOperator.js'
 import { registerProjectRoutes } from './projects.js'
 import { verifyPassword } from './password.js'
 import { ensureRedisConnected, redis } from './redis.js'
@@ -416,6 +419,7 @@ app.post('/api/v1/onboarding/complete', async (c) => {
 app.use('/api/platform/v1/*', async (c, next) => {
   if (deployment.deploymentMode === 'managed') return next()
   if (deployment.selfHostEdition === 'standard') {
+    if (deployment.runtimeEnvironment === 'live' && c.req.path.startsWith('/api/platform/v1/releases')) return next()
     return c.json({ error: 'Platform Admin is not included in the Standard self-host edition.', code: 'FEATURE_NOT_AVAILABLE' }, 404)
   }
   if (!await featureEntitled('platformAdmin')) {
@@ -425,8 +429,10 @@ app.use('/api/platform/v1/*', async (c, next) => {
 })
 
 registerPlatformAdminRoutes(app)
+registerReleaseOperatorRoutes(app)
 registerLicenseAuthorityRoutes(app)
 registerLicensingRoutes(app)
+registerFeatureFlagRoutes(app)
 registerApiTokenRoutes(app)
 registerCatalogueRoutes(app)
 registerOrganisationRoutes(app)
@@ -444,6 +450,8 @@ registerRmmPatchingRoutes(app)
 registerRmmAppPortalRoutes(app)
 registerRmmNetworkDiscoveryRoutes(app)
 registerRmmRecoveryKeyRoutes(app)
+
+app.get('/api/v1/openapi.json', (c) => c.json(buildOpenApiDocument(app, deployment)))
 
 app.notFound((c) => c.json({ error: 'Not found' }, 404))
 app.onError((error, c) => {

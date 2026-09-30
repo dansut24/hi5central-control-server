@@ -337,6 +337,8 @@ export function registerLicensingRoutes(app) {
     const license = await installationLicense()
     return c.json({
       deploymentMode: deployment.deploymentMode,
+      runtimeEnvironment: deployment.runtimeEnvironment,
+      featureMode: deployment.featureMode,
       edition: license.edition,
       status: license.status,
       licensingRequired: license.licensingRequired,
