@@ -1,6 +1,8 @@
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
+import { hasPermission } from './access.js'
+import { hasRecordPermission } from './itsmPermissions.js'
 
 const recordTypes = new Set(['Incident', 'Problem', 'Change'])
 const priorities = new Set(['Low', 'Medium', 'High', 'Critical'])
@@ -186,6 +188,8 @@ export function registerItsmRecordRoutes(app) {
 
     const recordType = text(c.req.query('type'), 40)
     if (recordType && !recordTypes.has(recordType)) return c.json({ error: 'Invalid record type.' }, 400)
+    if (recordType && !hasRecordPermission(auth.session, recordType, 'view')) return c.json({ error: 'You do not have permission to view these records.' }, 403)
+    if (!recordType && !hasPermission(auth.session.access, 'itsm.records.view_all')) return c.json({ error: 'You do not have permission to view all ITSM records.' }, 403)
     const status = text(c.req.query('status'), 80)
     const priority = text(c.req.query('priority'), 40)
     const team = text(c.req.query('team'), 160)
@@ -233,6 +237,7 @@ export function registerItsmRecordRoutes(app) {
     if (auth.error) return auth.error
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'view')) return c.json({ error: 'You do not have permission to view this record.' }, 403)
     return c.json(recordPayload(row, await activitiesFor(row.id)))
   })
 
@@ -245,6 +250,7 @@ export function registerItsmRecordRoutes(app) {
     const recordType = text(body?.type, 40)
     const title = text(body?.title, 240)
     if (!recordTypes.has(recordType)) return c.json({ error: 'Record type must be Incident, Problem or Change.' }, 400)
+    if (!hasRecordPermission(auth.session, recordType, 'create')) return c.json({ error: 'You do not have permission to create this record type.' }, 403)
     if (title.length < 3) return c.json({ error: 'Add a summary of at least 3 characters.' }, 400)
 
     const created = await withTransaction(async (client) => {
@@ -306,9 +312,11 @@ export function registerItsmRecordRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const current = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!current) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, current.record_type, 'edit')) return c.json({ error: 'You do not have permission to edit this record.' }, 403)
 
     const hasTeam = Object.prototype.hasOwnProperty.call(body, 'team')
     const hasAssignee = Object.prototype.hasOwnProperty.call(body, 'assignee')
+    if ((hasTeam || hasAssignee) && !hasRecordPermission(auth.session, current.record_type, 'assign')) return c.json({ error: 'You do not have permission to assign this record.' }, 403)
     const assigneeIdentity = hasAssignee ? text(body.assignee, 254) : ''
     const clearAssignee = hasAssignee && (!assigneeIdentity || assigneeIdentity === 'Unassigned')
     const team = hasTeam ? await teamByName(pool, auth.session.tenant_id, body.team) : null
@@ -320,6 +328,8 @@ export function registerItsmRecordRoutes(app) {
 
     const data = { ...object(current.record_data), ...object(body.recordData) }
     const status = Object.prototype.hasOwnProperty.call(body, 'status') ? text(body.status, 80) : current.status
+    const resolving = Object.prototype.hasOwnProperty.call(body, 'status') && ['Resolved', 'Closed', 'Completed', 'Cancelled'].includes(status)
+    if (resolving && !hasRecordPermission(auth.session, current.record_type, 'resolve')) return c.json({ error: 'You do not have permission to resolve or complete this record.' }, 403)
     const closedAt = ['Closed', 'Resolved', 'Completed', 'Cancelled'].includes(status) ? (current.closed_at || new Date()) : null
 
     const result = await pool.query(
@@ -368,8 +378,10 @@ export function registerItsmRecordRoutes(app) {
     try { body = await c.req.json() } catch { return c.json({ error: 'A valid JSON request body is required.' }, 400) }
     const row = await lookupRecord(auth.session.tenant_id, c.req.param('reference'))
     if (!row) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, row.record_type, 'edit')) return c.json({ error: 'You do not have permission to update this record.' }, 403)
     const kind = body?.kind === 'customer' ? 'customer' : body?.kind === 'system' ? 'system' : 'work'
     const visibility = kind === 'customer' ? 'customer' : 'internal'
+    if (visibility === 'internal' && !hasPermission(auth.session.access, 'itsm.comments.internal')) return c.json({ error: 'You do not have permission to add internal work notes.' }, 403)
     const bodyText = text(body?.text, 20000)
     if (!bodyText) return c.json({ error: 'Add activity text first.' }, 400)
     await pool.query(
