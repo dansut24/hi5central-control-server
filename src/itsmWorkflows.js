@@ -1,6 +1,8 @@
 import { originMatchesTenant } from './deploymentConfig.js'
 import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
+import { hasPermission } from './access.js'
+import { hasRecordPermission } from './itsmPermissions.js'
 
 const PROBLEM_TRANSITIONS = {
   New: ['Investigation'],
@@ -59,6 +61,16 @@ async function requireTechnician(c) {
 
 async function parseBody(c) {
   try { return await c.req.json() } catch { return null }
+}
+
+function canTransition(session, recordType, target) {
+  if (recordType === 'Service Request') return hasRecordPermission(session, recordType, 'fulfil')
+  if (recordType === 'Problem') return hasRecordPermission(session, recordType, ['Resolved', 'Closed'].includes(target) ? 'resolve' : 'edit')
+  if (recordType === 'Change') {
+    const implementation = ['Implementing', 'Review', 'Completed', 'Failed', 'Backed Out', 'Cancelled'].includes(target)
+    return hasRecordPermission(session, recordType, implementation ? 'resolve' : 'edit')
+  }
+  return false
 }
 
 async function findRecord(db, tenantId, reference, lock = false) {
@@ -436,6 +448,7 @@ export function registerWorkflowRoutes(app) {
     if (auth.error) return auth.error
     const found = await findRecord(pool, auth.session.tenant_id, c.req.param('reference'))
     if (!found) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (!hasRecordPermission(auth.session, found.row.resolved_type, 'view')) return c.json({ error: 'You do not have permission to view this workflow.' }, 403)
     return c.json(await workflowPayload(pool, found, auth.session.tenant_id, auth.session))
   })
 
@@ -450,6 +463,7 @@ export function registerWorkflowRoutes(app) {
       if (!found) return { notFound: true }
       if (found.kind === 'request') return { unsupported: true }
       if (!['Problem', 'Change'].includes(found.row.record_type)) return { unsupported: true }
+      if (!hasRecordPermission(auth.session, found.row.record_type, 'edit')) return { forbidden: true }
 
       const before = object(found.row.record_data)
       const patch = found.row.record_type === 'Problem'
@@ -468,6 +482,7 @@ export function registerWorkflowRoutes(app) {
 
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
     if (result.unsupported) return c.json({ error: 'Workflow data is available for Problems and Changes.' }, 400)
+    if (result.forbidden) return c.json({ error: 'You do not have permission to edit this workflow.' }, 403)
     return c.json(await workflowPayload(pool, result.found, auth.session.tenant_id, auth.session))
   })
 
@@ -482,6 +497,7 @@ export function registerWorkflowRoutes(app) {
       const result = await withTransaction(async (db) => {
         const found = await findRecord(db, auth.session.tenant_id, c.req.param('reference'), true)
         if (!found) return { notFound: true }
+        if (!canTransition(auth.session, found.row.resolved_type, target)) return { forbidden: true }
 
         if (found.kind === 'request') {
           const row = found.row
@@ -588,6 +604,7 @@ export function registerWorkflowRoutes(app) {
       })
 
       if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
+      if (result.forbidden) return c.json({ error: 'You do not have permission to perform this workflow transition.' }, 403)
       if (result.unsupported) return c.json({ error: 'This workflow is not available for this record type.' }, 400)
       if (result.invalid) return c.json({ error: result.invalid, blockers: result.blockers || [result.invalid] }, 409)
       return c.json(await workflowPayload(pool, result.found, auth.session.tenant_id, auth.session))
@@ -600,6 +617,7 @@ export function registerWorkflowRoutes(app) {
   app.post('/api/v1/workflows/:reference/approvals/:approvalId/decision', async (c) => {
     const auth = await requireTechnician(c)
     if (auth.error) return auth.error
+    if (!hasPermission(auth.session.access, 'itsm.changes.approve')) return c.json({ error: 'You do not have permission to approve Changes.' }, 403)
     const body = await parseBody(c)
     if (!body) return c.json({ error: 'A valid JSON request body is required.' }, 400)
     const decision = body.decision === 'Approved' ? 'Approved' : body.decision === 'Rejected' ? 'Rejected' : ''
