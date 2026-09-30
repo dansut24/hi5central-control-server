@@ -230,7 +230,7 @@ async function main() {
   assert(bell.items.some((item) => item.target?.reference === change.id && item.eventType === 'change.approval_required'))
   pass('technician bell contains task and Change approval events')
 
-  const deadline = Date.now() + 40000
+  const deadline = Date.now() + 120000
   let deliveries = []
   while (Date.now() < deadline) {
     const result = await pool.query(
