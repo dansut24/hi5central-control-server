@@ -11,6 +11,7 @@
     "start": "node src/index.js",
     "start:dist": "node dist/index.mjs",
     "test:licensing": "node scripts/test-license-envelope.mjs",
+    "test:release-feed": "node scripts/test-release-feed.mjs",
     "check:vendor-html": "node scripts/check-vendor-html.mjs"
   },
   "dependencies": {

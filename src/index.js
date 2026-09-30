@@ -40,6 +40,7 @@ import { registerOrganisationRoutes } from './organisation.js'
 import { buildOpenApiDocument } from './openapi.js'
 import { registerPlatformAdminRoutes } from './platformAdmin.js'
 import { registerReleaseOperatorRoutes } from './releaseOperator.js'
+import { registerReleaseFeedRoutes, startReleaseFeedScheduler } from './releaseFeed.js'
 import { registerProjectRoutes } from './projects.js'
 import { verifyPassword } from './password.js'
 import { ensureRedisConnected, redis } from './redis.js'
@@ -431,6 +432,7 @@ app.use('/api/platform/v1/*', async (c, next) => {
 
 registerPlatformAdminRoutes(app)
 registerReleaseOperatorRoutes(app)
+registerReleaseFeedRoutes(app)
 registerLicenseAuthorityRoutes(app)
 registerLicensingRoutes(app)
 registerFeatureFlagRoutes(app)
@@ -466,6 +468,7 @@ await pool.query('SELECT 1')
 await ensureRedisConnected()
 await initializeAgentBroker()
 startLicensingRefreshScheduler()
+startReleaseFeedScheduler()
 if (backgroundWorkersEnabled) {
   startMicrosoftSyncScheduler()
   startRmmVulnerabilitySyncScheduler()

@@ -577,6 +577,10 @@ export function registerPlatformAdminRoutes(app) {
     if (!['admin_controlled','hi5_managed'].includes(updateMode)) {
       return c.json({ error: 'updateMode must be admin_controlled or hi5_managed.' }, 400)
     }
+    if (updateMode === 'hi5_managed' && deployment.deploymentMode === 'self_hosted'
+      && !String(process.env.RELEASE_SIGNING_PUBLIC_KEY_PEM || process.env.LICENSING_PUBLIC_KEY_PEM || '').trim()) {
+      return c.json({ error: 'A trusted Hi5Central release-signing public key is required before managed updates can be enabled.' }, 409)
+    }
     const releaseChannel = clean(body?.releaseChannel, 20).toLowerCase() || 'stable'
     if (!['stable','preview'].includes(releaseChannel)) {
       return c.json({ error: 'releaseChannel must be stable or preview.' }, 400)
@@ -644,6 +648,10 @@ export function registerPlatformAdminRoutes(app) {
     const updateMode = clean(body?.updateMode, 40).toLowerCase()
     if (!['admin_controlled','hi5_managed'].includes(updateMode)) {
       return c.json({ error: 'updateMode must be admin_controlled or hi5_managed.' }, 400)
+    }
+    if (updateMode === 'hi5_managed' && deployment.deploymentMode === 'self_hosted'
+      && !String(process.env.RELEASE_SIGNING_PUBLIC_KEY_PEM || process.env.LICENSING_PUBLIC_KEY_PEM || '').trim()) {
+      return c.json({ error: 'A trusted Hi5Central release-signing public key is required before managed updates can be enabled.' }, 409)
     }
     const delay = body?.liveDelayHours == null ? 24 : Math.floor(Number(body.liveDelayHours))
     if (!Number.isFinite(delay) || delay < 0 || delay > 720) {

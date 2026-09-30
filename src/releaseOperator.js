@@ -25,6 +25,178 @@ function requireOperator(c) {
   return null
 }
 
+
+
+function localWindowParts(timeZone, date = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date)
+    return Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  } catch {
+    return localWindowParts('UTC', date)
+  }
+}
+
+function minuteOfDay(value, fallback) {
+  const match = String(value || '').match(/^(\d{2}):(\d{2})$/)
+  if (!match) return fallback
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) return fallback
+  return hour * 60 + minute
+}
+
+function withinMaintenanceWindow(windowValue, now = new Date()) {
+  const window = windowValue && typeof windowValue === 'object' && !Array.isArray(windowValue) ? windowValue : {}
+  const timeZone = String(window.timezone || 'UTC')
+  const local = localWindowParts(timeZone, now)
+  const weekday = String(local.weekday || '').toLowerCase().slice(0,3)
+  const configuredDays = Array.isArray(window.days)
+    ? window.days.map((day) => String(day).toLowerCase().slice(0,3)).filter(Boolean)
+    : []
+  if (configuredDays.length && !configuredDays.includes(weekday)) return false
+  const current = Number(local.hour || 0) * 60 + Number(local.minute || 0)
+  const start = minuteOfDay(window.start, 0)
+  const end = minuteOfDay(window.end, 24 * 60 - 1)
+  if (start === end) return true
+  return start < end ? current >= start && current < end : current >= start || current < end
+}
+
+async function queueManagedPromotion(db, { fromEnvironment, toEnvironment, releaseRef, changeIds, notBefore = null }) {
+  const existing = await db.query(
+    `SELECT id FROM platform_release_promotions
+      WHERE from_environment=$1 AND to_environment=$2 AND release_ref=$3
+        AND status IN ('requested','running','succeeded')
+      LIMIT 1`,
+    [fromEnvironment,toEnvironment,releaseRef],
+  )
+  if (existing.rowCount) return existing.rows[0].id
+
+  const promotion = await db.query(
+    `INSERT INTO platform_release_promotions
+      (from_environment,to_environment,status,release_ref)
+     VALUES ($1,$2,'requested',$3)
+     RETURNING id`,
+    [fromEnvironment,toEnvironment,releaseRef],
+  )
+  for (const changeId of changeIds) {
+    await db.query(
+      'INSERT INTO platform_release_promotion_items (promotion_id,change_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [promotion.rows[0].id,changeId],
+    )
+  }
+  await db.query(
+    `INSERT INTO platform_environment_actions
+      (environment,action,payload,not_before)
+     VALUES ($1,'promote',$2::jsonb,COALESCE($3::timestamptz,now()))`,
+    [
+      toEnvironment,
+      JSON.stringify({ promotionId: promotion.rows[0].id, changeIds, releaseRef, source: 'hi5-managed-policy' }),
+      notBefore,
+    ],
+  )
+  return promotion.rows[0].id
+}
+
+async function applyManagedTenantFeatureActivation(db, environment, changeIds) {
+  if (!changeIds.length || !['uat','live'].includes(environment)) return
+  const featureRows = await db.query(
+    `SELECT feature_key FROM platform_release_changes
+      WHERE id=ANY($1::uuid[]) AND feature_key IS NOT NULL`,
+    [changeIds],
+  )
+  if (!featureRows.rowCount) return
+  const tenants = await db.query(
+    `SELECT tenant_id FROM tenant_release_preferences
+      WHERE update_mode='hi5_managed'`,
+  )
+  for (const tenant of tenants.rows) {
+    for (const change of featureRows.rows) {
+      await db.query(
+        `INSERT INTO tenant_environment_feature_overrides
+          (tenant_id,environment,feature_key,enabled)
+         VALUES ($1,$2,$3,true)
+         ON CONFLICT (tenant_id,environment,feature_key) DO UPDATE
+         SET enabled=true,updated_at=now()`,
+        [tenant.tenant_id,environment,change.feature_key],
+      )
+    }
+  }
+}
+
+async function continueManagedReleaseFlow(db, current, releaseRef, changeIds) {
+  const preferenceResult = await db.query(
+    `SELECT * FROM platform_release_preferences WHERE preference_key='deployment' LIMIT 1`,
+  )
+  const preference = preferenceResult.rows[0]
+  if (!preference || preference.update_mode !== 'hi5_managed') return
+
+  if (current.environment === 'test' && current.action === 'deploy') {
+    if (changeIds.length) {
+      await db.query(
+        `INSERT INTO platform_release_test_results
+          (change_id,environment,result,notes,evidence)
+         SELECT id,'test','passed','Automated Hi5Central health gate passed.',
+                jsonb_build_object('source','hi5-managed-policy','releaseRef',$2::text)
+           FROM platform_release_changes
+          WHERE id=ANY($1::uuid[])`,
+        [changeIds,releaseRef],
+      )
+      await db.query(
+        `UPDATE platform_release_changes
+            SET state='ready_for_uat',updated_at=now()
+          WHERE id=ANY($1::uuid[]) AND state<>'promoted'`,
+        [changeIds],
+      )
+    }
+    if (preference.uat_auto_stage) {
+      await queueManagedPromotion(db, {
+        fromEnvironment: 'test',
+        toEnvironment: 'uat',
+        releaseRef,
+        changeIds,
+      })
+    }
+    return
+  }
+
+  if (current.environment === 'uat' && current.action === 'promote') {
+    if (changeIds.length) {
+      await db.query(
+        `INSERT INTO platform_release_test_results
+          (change_id,environment,result,notes,evidence)
+         SELECT id,'uat','passed','Automated Hi5Central UAT health gate passed.',
+                jsonb_build_object('source','hi5-managed-policy','releaseRef',$2::text)
+           FROM platform_release_changes
+          WHERE id=ANY($1::uuid[])`,
+        [changeIds,releaseRef],
+      )
+      await db.query(
+        `UPDATE platform_release_changes
+            SET state='selected_for_live',updated_at=now()
+          WHERE id=ANY($1::uuid[]) AND state<>'promoted'`,
+        [changeIds],
+      )
+    }
+    if (preference.live_auto_promote) {
+      const delayHours = Math.max(0, Math.min(720, Number(preference.live_delay_hours || 0)))
+      const notBefore = new Date(Date.now() + delayHours * 60 * 60 * 1000).toISOString()
+      await queueManagedPromotion(db, {
+        fromEnvironment: 'uat',
+        toEnvironment: 'live',
+        releaseRef,
+        changeIds,
+        notBefore,
+      })
+    }
+  }
+}
+
 function actionPayload(row) {
   if (!row) return null
   return {
@@ -34,6 +206,7 @@ function actionPayload(row) {
     status: row.status,
     payload: row.payload || {},
     requestedAt: row.requested_at,
+    notBefore: row.not_before,
     startedAt: row.started_at,
   }
 }
@@ -53,20 +226,36 @@ export function registerReleaseOperatorRoutes(app) {
     const denied = requireOperator(c)
     if (denied) return denied
     const result = await withTransaction(async (db) => {
+      const next = await db.query(
+        `SELECT *
+           FROM platform_environment_actions
+          WHERE status='requested' AND not_before<=now()
+          ORDER BY not_before,requested_at
+          FOR UPDATE SKIP LOCKED
+          LIMIT 1`,
+      )
+      const candidate = next.rows[0]
+      if (!candidate) return null
+
+      if (candidate.action === 'promote' && candidate.environment === 'live') {
+        const preference = await db.query(
+          `SELECT update_mode,maintenance_window
+             FROM platform_release_preferences
+            WHERE preference_key='deployment'
+            LIMIT 1`,
+        )
+        const policy = preference.rows[0]
+        if (policy?.update_mode === 'hi5_managed' && !withinMaintenanceWindow(policy.maintenance_window)) {
+          return null
+        }
+      }
+
       const claimed = await db.query(
-        `WITH next_action AS (
-           SELECT id
-             FROM platform_environment_actions
-            WHERE status='requested'
-            ORDER BY requested_at
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-         )
-         UPDATE platform_environment_actions a
+        `UPDATE platform_environment_actions
             SET status='running',started_at=now(),error_message=''
-           FROM next_action n
-          WHERE a.id=n.id
-         RETURNING a.*`,
+          WHERE id=$1 AND status='requested'
+          RETURNING *`,
+        [candidate.id],
       )
       const row = claimed.rows[0]
       if (!row) return null
@@ -130,13 +319,14 @@ export function registerReleaseOperatorRoutes(app) {
       }
 
       if (status === 'succeeded') {
-        if (current.action === 'reset' && current.environment === 'test') {
+        if (current.environment === 'test' && ['reset','deploy'].includes(current.action)) {
           await db.query(
             `UPDATE platform_environment_state
-                SET last_reset_at=now(),last_deployed_at=now(),
+                SET last_reset_at=CASE WHEN $2='reset' THEN now() ELSE last_reset_at END,
+                    last_deployed_at=now(),
                     active_release_ref=COALESCE(NULLIF($1,''),active_release_ref),updated_at=now()
               WHERE environment='test'`,
-            [releaseRef],
+            [releaseRef || String(current.payload?.releaseRef || ''),current.action],
           )
         }
 
@@ -152,32 +342,24 @@ export function registerReleaseOperatorRoutes(app) {
           const changeIds = Array.isArray(current.payload?.changeIds)
             ? current.payload.changeIds.map(String).filter(Boolean)
             : []
-          if (changeIds.length) {
-            const featureRows = await db.query(
-              `SELECT id,feature_key FROM platform_release_changes
-                WHERE id=ANY($1::uuid[])`,
+          await applyManagedTenantFeatureActivation(db, current.environment, changeIds)
+          if (changeIds.length && current.environment === 'live') {
+            await db.query(
+              `UPDATE platform_release_changes
+                  SET state='promoted',promoted_at=now(),updated_at=now()
+                WHERE id=ANY($1::uuid[]) AND state='selected_for_live'`,
               [changeIds],
             )
-            for (const change of featureRows.rows) {
-              if (!change.feature_key) continue
-              await db.query(
-                `INSERT INTO platform_environment_feature_flags
-                  (environment,feature_key,enabled,updated_by)
-                 VALUES ($1,$2,true,$3)
-                 ON CONFLICT (environment,feature_key) DO UPDATE
-                 SET enabled=true,updated_by=EXCLUDED.updated_by,updated_at=now()`,
-                [current.environment,change.feature_key,current.requested_by],
-              )
-            }
-            if (current.environment === 'live') {
-              await db.query(
-                `UPDATE platform_release_changes
-                    SET state='promoted',promoted_at=now(),updated_at=now()
-                  WHERE id=ANY($1::uuid[]) AND state='selected_for_live'`,
-                [changeIds],
-              )
-            }
           }
+        }
+
+        const flowChangeIds = Array.isArray(current.payload?.changeIds)
+          ? current.payload.changeIds.map(String).filter(Boolean)
+          : []
+        const flowReleaseRef = releaseRef || String(current.payload?.releaseRef || '')
+        if ((current.action === 'deploy' && current.environment === 'test')
+          || (current.action === 'promote' && current.environment === 'uat')) {
+          await continueManagedReleaseFlow(db, current, flowReleaseRef, flowChangeIds)
         }
       }
       return { action: updated.rows[0] }
