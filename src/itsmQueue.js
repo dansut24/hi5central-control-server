@@ -115,6 +115,7 @@ export function registerItsmQueueRoutes(app) {
     const options = await pool.query(
       `${baseSql}
        SELECT
+         array_remove(array_agg(DISTINCT record_type), NULL) AS types,
          array_remove(array_agg(DISTINCT status), NULL) AS statuses,
          array_remove(array_agg(DISTINCT priority), NULL) AS priorities,
          array_remove(array_agg(DISTINCT team), NULL) AS teams,
@@ -145,6 +146,7 @@ export function registerItsmQueueRoutes(app) {
       limit,
       offset,
       filters: {
+        types: options.rows[0]?.types || [],
         statuses: options.rows[0]?.statuses || [],
         priorities: options.rows[0]?.priorities || [],
         teams: options.rows[0]?.teams || [],
