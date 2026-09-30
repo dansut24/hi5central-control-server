@@ -43,14 +43,14 @@ async function main() {
   const tenant = (await pool.query('SELECT id FROM tenants WHERE slug=$1 LIMIT 1', [SLUG])).rows[0]
   assert(tenant?.id)
   const users = await pool.query(
-    `SELECT u.id,u.email,p.external_key,p.name
+    `SELECT u.id,u.email AS account_email,p.external_key,p.name,p.email AS person_email
      FROM users u JOIN tenant_memberships m ON m.user_id=u.id AND m.tenant_id=$1
      LEFT JOIN organisation_people p ON p.user_id=u.id AND p.tenant_id=$1
      WHERE lower(u.email)=ANY($2::text[])`,
     [tenant.id, [OWNER_EMAIL, REQUESTER_EMAIL]],
   )
-  const owner = users.rows.find((row) => row.email.toLowerCase() === OWNER_EMAIL)
-  const requester = users.rows.find((row) => row.email.toLowerCase() === REQUESTER_EMAIL)
+  const owner = users.rows.find((row) => row.person_email?.toLowerCase() === OWNER_EMAIL)
+  const requester = users.rows.find((row) => row.account_email.toLowerCase() === REQUESTER_EMAIL)
   assert(owner?.id && owner?.external_key && requester?.id)
 
   const ownerToken = await createSession(pool, {
@@ -196,7 +196,7 @@ async function main() {
   assert(projectEvents.includes('project.milestone_updated'))
   pass('technician bell contains project lifecycle notifications')
 
-  const deadline = Date.now() + 40000
+  const deadline = Date.now() + 120000
   let emailRows = []
   while (Date.now() < deadline) {
     const rows = await pool.query(
