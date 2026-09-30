@@ -2,6 +2,7 @@ import { hasPermission } from './access.js'
 import { pool, withTransaction } from './db.js'
 import { registerAssignmentRoutes } from './assignment.js'
 import { registerItsmLifecycleRoutes } from './itsmLifecycle.js'
+import { registerItsmInsightRoutes } from './itsmInsights.js'
 import { registerItsmQueueRoutes } from './itsmQueue.js'
 import { registerItsmRecordRoutes } from './itsmRecords.js'
 import { registerPortalAuthRoutes } from './portalAuth.js'
@@ -475,5 +476,6 @@ export function registerCatalogueRoutes(app) {
   registerTaskOwnershipRoutes(app)
   registerItsmRecordRoutes(app)
   registerItsmLifecycleRoutes(app)
+  registerItsmInsightRoutes(app)
   registerItsmQueueRoutes(app)
 }
