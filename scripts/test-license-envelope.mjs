@@ -17,6 +17,7 @@ const envelope = buildLicenseEnvelope({
     products: ['itsm', 'rmm'],
     features: { multiTenant: true, platformAdmin: true, whiteLabel: true },
     limits: { tenants: 25, users: null, devices: 500 },
+    supportUntil: new Date('2027-09-30T12:00:00.000Z'),
   },
   issuedAt: '2026-09-30T12:00:00.000Z',
   expiresAt: '2027-09-30T12:00:00.000Z',
@@ -26,6 +27,11 @@ const envelope = buildLicenseEnvelope({
 const signature = signLicenseEnvelope(envelope, privateKey)
 if (!verifyLicenseEnvelope(envelope, signature, publicKey)) {
   throw new Error('Valid licence envelope did not verify')
+}
+
+const transported = JSON.parse(JSON.stringify(envelope))
+if (!verifyLicenseEnvelope(transported, signature, publicKey)) {
+  throw new Error('JSON round-tripped licence envelope did not verify')
 }
 
 const tampered = structuredClone(envelope)

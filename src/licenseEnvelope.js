@@ -7,6 +7,7 @@ function iso(value) {
 }
 
 export function canonicaliseLicenseValue(value) {
+  if (value instanceof Date) return JSON.stringify(value.toISOString())
   if (Array.isArray(value)) return `[${value.map(canonicaliseLicenseValue).join(',')}]`
   if (value && typeof value === 'object') {
     const keys = Object.keys(value).sort()

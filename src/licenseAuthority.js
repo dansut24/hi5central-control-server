@@ -40,8 +40,8 @@ function entitlementPayload(row) {
       users: row.user_limit == null ? null : Number(row.user_limit),
       devices: row.device_limit == null ? null : Number(row.device_limit),
     },
-    supportUntil: row.expires_at || null,
-    updatesUntil: row.expires_at || null,
+    supportUntil: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+    updatesUntil: row.expires_at ? new Date(row.expires_at).toISOString() : null,
   }
 }
 
