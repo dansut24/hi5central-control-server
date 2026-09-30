@@ -2,6 +2,8 @@ import { pool, withTransaction } from './db.js'
 import { resolveSession } from './session.js'
 import { originMatchesTenant } from './deploymentConfig.js'
 import { assignmentDirectory } from './assignment.js'
+import { hasPermission } from './access.js'
+import { hasRecordPermission } from './itsmPermissions.js'
 
 const recordTaskStatuses = new Set(['Open', 'In Progress', 'Blocked', 'Completed', 'Cancelled'])
 
@@ -154,6 +156,7 @@ export function registerItsmActionRoutes(app) {
     const result = await withTransaction(async (client) => {
       const current = await recordFor(client, auth.session.tenant_id, c.req.param('reference'), true)
       if (!current) return { notFound: true }
+      if (!hasRecordPermission(auth.session, current.record_type, 'assign')) return { forbidden: true }
       if (Number(current.version || 1) !== version) return { conflict: true, current }
 
       const requestedTeam = text(body.team, 160)
@@ -217,6 +220,7 @@ export function registerItsmActionRoutes(app) {
     })
 
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (result.forbidden) return c.json({ error: 'You do not have permission to assign this record.' }, 403)
     if (result.invalidTeam) return c.json({ error: 'Choose an active assignment group from this tenant.' }, 400)
     if (result.invalidAssignee) return c.json({ error: 'Choose an active assignee from this tenant.' }, 400)
     if (result.invalidAssignment) return c.json({ error: result.invalidAssignment }, 422)
@@ -237,6 +241,7 @@ export function registerItsmActionRoutes(app) {
     const result = await withTransaction(async (client) => {
       const current = await recordFor(client, auth.session.tenant_id, c.req.param('reference'), true)
       if (!current) return { notFound: true }
+      if (!hasRecordPermission(auth.session, current.record_type, 'resolve')) return { forbidden: true }
       if (Number(current.version || 1) !== version) return { conflict: true, current }
       if (['Resolved', 'Closed', 'Completed', 'Cancelled'].includes(current.status)) return { alreadyFinal: true }
 
@@ -292,6 +297,7 @@ export function registerItsmActionRoutes(app) {
     })
 
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
+    if (result.forbidden) return c.json({ error: 'You do not have permission to resolve or complete this record.' }, 403)
     if (result.alreadyFinal) return c.json({ error: 'This record is already in a final state.' }, 409)
     if (result.resolutionCodeRequired) return c.json({ error: 'Choose a resolution code before resolving this Incident.' }, 400)
     if (result.conflict) return conflictResponse(c, result.current)
@@ -313,8 +319,9 @@ export function registerItsmActionRoutes(app) {
     const result = await withTransaction(async (client) => {
       const current = await recordFor(client, auth.session.tenant_id, c.req.param('reference'), true)
       if (!current) return { notFound: true }
-      if (Number(current.version || 1) !== version) return { conflict: true, current }
       if (current.record_type !== 'Incident') return { incidentOnly: true }
+      if (!hasRecordPermission(auth.session, current.record_type, 'edit')) return { forbidden: true }
+      if (Number(current.version || 1) !== version) return { conflict: true, current }
       if (['Resolved', 'Closed'].includes(current.status)) return { alreadyFinal: true }
       const visibility = body.visibility === 'customer' ? 'customer' : 'internal'
 
@@ -348,6 +355,7 @@ export function registerItsmActionRoutes(app) {
 
     if (result.notFound) return c.json({ error: 'ITSM record not found.' }, 404)
     if (result.incidentOnly) return c.json({ error: 'Pending customer/vendor is currently available for Incidents only.' }, 400)
+    if (result.forbidden) return c.json({ error: 'You do not have permission to edit this Incident.' }, 403)
     if (result.alreadyFinal) return c.json({ error: 'Reopen the Incident before setting it to pending.' }, 409)
     if (result.conflict) return conflictResponse(c, result.current)
     return c.json({ ok: true, reference: result.updated.reference, version: Number(result.updated.version), status: targetStatus })
@@ -356,6 +364,7 @@ export function registerItsmActionRoutes(app) {
   app.get('/api/v1/itsm-actions/:reference/tasks', async (c) => {
     const auth = await requireTechnician(c)
     if (auth.error) return auth.error
+    if (!hasPermission(auth.session.access, 'itsm.tasks.view')) return c.json({ error: 'You do not have permission to view tasks.' }, 403)
     const record = await recordFor(pool, auth.session.tenant_id, c.req.param('reference'))
     if (!record) return c.json({ error: 'ITSM record not found.' }, 404)
     const result = await pool.query(
@@ -385,6 +394,7 @@ export function registerItsmActionRoutes(app) {
   app.post('/api/v1/itsm-actions/:reference/tasks', async (c) => {
     const auth = await requireTechnician(c)
     if (auth.error) return auth.error
+    if (!hasPermission(auth.session.access, 'itsm.tasks.manage')) return c.json({ error: 'You do not have permission to manage tasks.' }, 403)
     const body = await parseJson(c)
     if (!body) return c.json({ error: 'A valid JSON request body is required.' }, 400)
     const version = expectedVersion(body)
@@ -477,6 +487,7 @@ export function registerItsmActionRoutes(app) {
   app.patch('/api/v1/itsm-actions/:reference/tasks/:taskId', async (c) => {
     const auth = await requireTechnician(c)
     if (auth.error) return auth.error
+    if (!hasPermission(auth.session.access, 'itsm.tasks.manage')) return c.json({ error: 'You do not have permission to manage tasks.' }, 403)
     const body = await parseJson(c)
     if (!body) return c.json({ error: 'A valid JSON request body is required.' }, 400)
     const version = expectedVersion(body)
