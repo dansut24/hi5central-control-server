@@ -134,9 +134,9 @@ export function registerReleaseOperatorRoutes(app) {
           await db.query(
             `UPDATE platform_environment_state
                 SET last_reset_at=now(),last_deployed_at=now(),
-                    active_release_ref=COALESCE(NULLIF($2,''),active_release_ref),updated_at=now()
+                    active_release_ref=COALESCE(NULLIF($1,''),active_release_ref),updated_at=now()
               WHERE environment='test'`,
-            [id,releaseRef],
+            [releaseRef],
           )
         }
 
