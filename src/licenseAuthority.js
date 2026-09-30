@@ -33,6 +33,7 @@ function authorityError(message, status = 400, code = 'LICENSE_ERROR') {
 function entitlementPayload(row) {
   return {
     edition: 'msp',
+    licenseStatus: row.status === 'active' ? 'active' : 'suspended',
     products: Array.isArray(row.products) ? row.products : ['itsm', 'rmm'],
     features: row.features && typeof row.features === 'object' ? row.features : {},
     limits: {
@@ -180,10 +181,11 @@ export async function refreshMspLicense({ refreshToken, installationId }) {
     )
     if (!result.rowCount) throw authorityError('Refresh credential is invalid.', 401, 'REFRESH_INVALID')
     const row = result.rows[0]
-    if (row.status !== 'active') throw authorityError('Licence is not active.', 403, 'LICENSE_INACTIVE')
-    const finalGrace = graceUntil(row.expires_at, row.grace_days)
-    if (finalGrace && finalGrace.getTime() < Date.now()) {
-      throw authorityError('Licence has expired.', 403, 'LICENSE_EXPIRED')
+    if (row.status === 'active') {
+      const finalGrace = graceUntil(row.expires_at, row.grace_days)
+      if (finalGrace && finalGrace.getTime() < Date.now()) {
+        throw authorityError('Licence has expired.', 403, 'LICENSE_EXPIRED')
+      }
     }
     await db.query(
       'UPDATE msp_licenses SET last_refreshed_at=now(),updated_at=now() WHERE id=$1',

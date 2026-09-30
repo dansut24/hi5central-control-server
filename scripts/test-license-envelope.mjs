@@ -14,6 +14,7 @@ const envelope = buildLicenseEnvelope({
   installationId: '00000000-0000-4000-8000-000000000001',
   entitlementPayload: {
     edition: 'msp',
+    licenseStatus: 'active',
     products: ['itsm', 'rmm'],
     features: { multiTenant: true, platformAdmin: true, whiteLabel: true },
     limits: { tenants: 25, users: null, devices: 500 },
@@ -45,4 +46,10 @@ if (verifyLicenseEnvelope(rebound, signature, publicKey)) {
   throw new Error('Entitlement unexpectedly verified for another installation')
 }
 
-console.log('Licence envelope signing, binding and tamper detection passed')
+const statusTampered = structuredClone(envelope)
+statusTampered.entitlementPayload.licenseStatus = 'suspended'
+if (verifyLicenseEnvelope(statusTampered, signature, publicKey)) {
+  throw new Error('Tampered licence status unexpectedly verified')
+}
+
+console.log('Licence envelope signing, transport, status and tamper detection passed')

@@ -211,13 +211,17 @@ async function persistAuthorityResponse(response, installationId, { keyHash = nu
   if (String(envelope?.entitlementPayload?.edition || '') !== 'msp') {
     throw new Error('Licensing service returned an invalid entitlement edition.')
   }
+  const authorityStatus = String(envelope?.entitlementPayload?.licenseStatus || 'active')
+  if (!['active', 'suspended'].includes(authorityStatus)) {
+    throw new Error('Licensing service returned an invalid entitlement status.')
+  }
   if (!verifyLicenseEnvelope(envelope, signature, publicKey)) {
     throw new Error('Licensing service returned an invalid entitlement signature.')
   }
 
   await pool.query(
     `UPDATE installation_licensing
-        SET license_status='active',
+        SET license_status=$9,
             license_key_hash=COALESCE($2,license_key_hash),
             entitlement_payload=$3::jsonb,
             entitlement_signature=$4,
@@ -238,6 +242,7 @@ async function persistAuthorityResponse(response, installationId, { keyHash = nu
       envelope.expiresAt || null,
       envelope.graceUntil || null,
       refreshToken,
+      authorityStatus,
     ],
   )
 }
