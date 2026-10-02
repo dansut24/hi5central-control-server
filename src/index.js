@@ -276,7 +276,8 @@ app.post('/api/v1/auth/signup', async (c) => {
   const verificationToken = randomBytes(32).toString('base64url')
   const verificationTokenHash = hashToken(verificationToken)
   const generatedUrls = tenantUrls(tenantSlug, { rmm: modules.includes('rmm') })
-  const { tenantUrl, portalUrl, rmmUrl } = generatedUrls
+  const { tenantUrl, rmmUrl } = generatedUrls
+  const portalUrl = modules.includes('itsm') ? generatedUrls.portalUrl : null
 
   try {
     const result = await withTransaction(async (client) => {
@@ -288,7 +289,7 @@ app.post('/api/v1/auth/signup', async (c) => {
       await client.query(
         `INSERT INTO tenant_settings (tenant_id,modules,onboarding_step,tenant_url,portal_url,rmm_url)
          VALUES ($1,$2::jsonb,'verify_email',$3,$4,$5)`,
-        [tenant.id, JSON.stringify({ itsm: modules.includes('itsm'), rmm: modules.includes('rmm') }), tenantUrl, portalUrl, rmmUrl],
+        [tenant.id, JSON.stringify({ itsm: modules.includes('itsm'), selfService: modules.includes('itsm'), rmm: modules.includes('rmm') }), tenantUrl, portalUrl, rmmUrl],
       )
       await client.query(
         `INSERT INTO user_email_verifications (tenant_id,user_id,token_hash,redirect_url,expires_at)
