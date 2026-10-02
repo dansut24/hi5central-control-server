@@ -16,6 +16,8 @@ import { ingestWindowsUpdateInventory, reconcileWindowsUpdateJobResult } from '.
 import { resolveSession } from './session.js'
 
 const AGENT_DOWNLOAD_URL = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe'
+const AGENT_DOWNLOAD_URL_LINUX = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-linux-x64.tar.gz'
+const AGENT_DOWNLOAD_URL_MACOS = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-macOS-universal.tar.gz'
 const MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 const AGENT_BROKER_INSTANCE_ID = String(process.env.API_INSTANCE_ID || process.env.HOSTNAME || `api-${process.pid}`) + '-' + randomUUID().slice(0, 8)
 const AGENT_BROKER_OWNER_HASH = 'hi5central:rmm:agent:owners'
@@ -27,6 +29,7 @@ const AGENT_BROKER_HEARTBEAT_MS = 5_000
 const AGENT_BROKER_STALE_MS = 20_000
 
 function clean(value = '') { return String(value ?? '').trim() }
+function shellSingleQuote(value = '') { return "'" + String(value).replaceAll("'", "'\"'\"'") + "'" }
 function canonicalAgentPlatform(value = '') {
   const normalized = clean(value).toLowerCase()
   if (['macos','mac','darwin','osx'].includes(normalized)) return 'macOS'
@@ -517,7 +520,15 @@ export function registerRmmAgentRoutes(app) {
   app.get('/api/v1/rmm/agent/enrollment-packages', async (c) => {
     const auth = await requireRmmManager(c)
     if (auth.error) return auth.error
-    return c.json({ packages: await packageRows(auth.session.tenant_id), downloadUrl: AGENT_DOWNLOAD_URL })
+    return c.json({
+      packages: await packageRows(auth.session.tenant_id),
+      downloadUrl: AGENT_DOWNLOAD_URL,
+      downloads: {
+        windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
+        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.1' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.1' },
+      },
+    })
   })
 
   app.post('/api/v1/rmm/agent/enrollment-packages', async (c) => {
@@ -527,7 +538,7 @@ export function registerRmmAgentRoutes(app) {
     const ttlMinutes = boundedInteger(body.ttlMinutes ?? 60, 5, 1440) || 60
     const maxUses = boundedInteger(body.maxUses ?? 1, 1, 100) || 1
     const token = secret('h5e')
-    const label = clean(body.label).slice(0, 120) || 'Windows Agent'
+    const label = clean(body.label).slice(0, 120) || 'Hi5Central Agent deployment'
     const result = await pool.query(
       `INSERT INTO rmm_agent_enrollment_packages
          (tenant_id,label,token_hash,token_hint,expires_at,max_uses,created_by_user_id)
@@ -537,7 +548,25 @@ export function registerRmmAgentRoutes(app) {
     )
     const pkg = result.rows[0]
     const installCommand = `.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ENROLLMENT_TOKEN="${token}" /TENANT_ID="${auth.session.tenant_id}" /PACKAGE_ID="${pkg.id}" /INSTALL_SOURCE="rmm-portal"`
-    return c.json({ package: pkg, enrollmentToken: token, downloadUrl: AGENT_DOWNLOAD_URL, installCommand }, 201)
+    const quotedToken = shellSingleQuote(token)
+    const linuxInstallCommand = `tmp="$(mktemp -d)" && curl -fsSL ${shellSingleQuote(AGENT_DOWNLOAD_URL_LINUX)} -o "$tmp/agent.tar.gz" && tar -xzf "$tmp/agent.tar.gz" -C "$tmp" && sudo "$tmp/installer/linux/install.sh" --enrollment-token ${quotedToken}`
+    const macosInstallCommand = `tmp="$(mktemp -d)" && curl -fsSL ${shellSingleQuote(AGENT_DOWNLOAD_URL_MACOS)} -o "$tmp/agent.tar.gz" && tar -xzf "$tmp/agent.tar.gz" -C "$tmp" && sudo "$tmp/installer/macos/install.sh" --enrollment-token ${quotedToken}`
+    return c.json({
+      package: pkg,
+      enrollmentToken: token,
+      downloadUrl: AGENT_DOWNLOAD_URL,
+      installCommand,
+      downloads: {
+        windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
+        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.1' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.1' },
+      },
+      installCommands: {
+        windows: installCommand,
+        macos: macosInstallCommand,
+        linux: linuxInstallCommand,
+      },
+    }, 201)
   })
 
   app.post('/api/v1/rmm/agent/enrollment-packages/:packageId/revoke', async (c) => {
