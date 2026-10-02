@@ -1091,6 +1091,7 @@ export function registerPlatformAdminRoutes(app) {
       return c.json({ error: 'Company name and a valid tenant slug are required.' }, 400)
     }
     const itsm = body?.modules?.itsm !== false
+    const selfService = itsm
     const rmm = body?.modules?.rmm === true
     const status = ['pending_verification','active','suspended','closed'].includes(body?.status) ? body.status : 'active'
     const urls = tenantUrls(slug, { rmm })
@@ -1105,7 +1106,7 @@ export function registerPlatformAdminRoutes(app) {
         await db.query(
           `INSERT INTO tenant_settings (tenant_id,modules,onboarding_step,tenant_url,portal_url,rmm_url)
            VALUES ($1,$2::jsonb,'company',$3,$4,$5)`,
-          [row.id, JSON.stringify({ itsm, rmm }), urls.tenantUrl, urls.portalUrl, urls.rmmUrl],
+          [row.id, JSON.stringify({ itsm, selfService, rmm }), urls.tenantUrl, itsm ? urls.portalUrl : null, urls.rmmUrl],
         )
         await db.query(
           `INSERT INTO tenant_commercial_settings (tenant_id,plan_key,billing_status,billing_cycle)
@@ -1114,7 +1115,7 @@ export function registerPlatformAdminRoutes(app) {
             ['trial','active','past_due','suspended','cancelled'].includes(body?.billingStatus) ? body.billingStatus : 'trial',
             ['monthly','annual','custom'].includes(body?.billingCycle) ? body.billingCycle : 'monthly'],
         )
-        await audit(c, auth.session, 'tenant.created', 'tenant', row.id, { slug, companyName, modules: { itsm, rmm } }, db)
+        await audit(c, auth.session, 'tenant.created', 'tenant', row.id, { slug, companyName, modules: { itsm, selfService, rmm } }, db)
         return row
       })
       return c.json({ tenant }, 201)
@@ -1141,8 +1142,10 @@ export function registerPlatformAdminRoutes(app) {
     )
     if (!existing.rowCount) return c.json({ error: 'Tenant not found.' }, 404)
     const current = existing.rows[0]
+    const itsmEnabled = body?.modules?.itsm ?? Boolean(current.modules?.itsm)
     const modules = {
-      itsm: body?.modules?.itsm ?? Boolean(current.modules?.itsm),
+      itsm: itsmEnabled,
+      selfService: Boolean(itsmEnabled),
       rmm: body?.modules?.rmm ?? Boolean(current.modules?.rmm),
     }
     const urls = tenantUrls(current.slug, { rmm: modules.rmm })
@@ -1158,7 +1161,7 @@ export function registerPlatformAdminRoutes(app) {
         await db.query(
           `UPDATE tenant_settings SET modules=$2::jsonb,tenant_url=$3,portal_url=$4,rmm_url=$5,updated_at=now()
             WHERE tenant_id=$1`,
-          [tenantId, JSON.stringify(modules), urls.tenantUrl, urls.portalUrl, urls.rmmUrl],
+          [tenantId, JSON.stringify(modules), urls.tenantUrl, modules.itsm ? urls.portalUrl : null, urls.rmmUrl],
         )
       }
       if (touchesBilling) {
