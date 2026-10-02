@@ -69,7 +69,7 @@ function viewerDownloadUrlForPlatform(platform = '') {
   if (platform === 'macos') return VIEWER_DOWNLOAD_URL_MACOS
   if (platform === 'linux') return VIEWER_DOWNLOAD_URL_LINUX
   if (platform === 'windows') return VIEWER_DOWNLOAD_URL_WINDOWS
-  return VIEWER_DOWNLOAD_URL_WINDOWS
+  return null
 }
 function safeSend(ws, payload) {
   if (!ws || ws.readyState !== 1) return false
