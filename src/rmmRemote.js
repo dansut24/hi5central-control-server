@@ -122,6 +122,7 @@ function browserLaunchUrl(slug, payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
     ice,
   })
   const base = tenantUrls(slug, { rmm: true }).rmmUrl || `https://${slug}-rmm.${ROOT_DOMAIN}`
@@ -135,6 +136,7 @@ function nativeLaunchUrl(payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
   })
   return `hi5central-viewer://connect?${query.toString()}`
 }
@@ -240,6 +242,7 @@ export function registerRmmRemoteRoutes(app) {
       token,
       wssUrl: VIEWER_WS_URL,
       mode,
+      sessionType: 'unattended',
       iceServers: ice.viewer,
     }
     return c.json({
