@@ -27,6 +27,12 @@ const AGENT_BROKER_HEARTBEAT_MS = 5_000
 const AGENT_BROKER_STALE_MS = 20_000
 
 function clean(value = '') { return String(value ?? '').trim() }
+function canonicalAgentPlatform(value = '') {
+  const normalized = clean(value).toLowerCase()
+  if (['macos','mac','darwin','osx'].includes(normalized)) return 'macOS'
+  if (['linux','ubuntu','debian','mint','fedora','rhel','centos'].includes(normalized)) return 'Linux'
+  return 'Windows'
+}
 function isUuid(value = '') { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean(value)) }
 function sha256(value = '') { return createHash('sha256').update(String(value)).digest('hex') }
 function secret(prefix) { return `${prefix}_${randomBytes(32).toString('base64url')}` }
@@ -431,7 +437,9 @@ async function ingestInventory(agent, payload) {
   const agentInfo = payload?.agent && typeof payload.agent === 'object' ? payload.agent : {}
   const storage = storageTotals(payload?.storage)
   const collectedAt = clean(payload?.collected_at) || new Date().toISOString()
-  const hostname = clean(summary.hostname) || agent.name || 'Windows device'
+  const platform = canonicalAgentPlatform(summary.platform || payload?.platform || os.platform || os.name)
+  const operatingSystem = clean(summary.operating_system || summary.os_name || os.name || platform)
+  const hostname = clean(summary.hostname) || agent.name || (platform + ' device')
   await withTransaction(async (client) => {
     const previousResult = await client.query(
       'SELECT source_payload FROM rmm_device_inventory WHERE id=$1 FOR UPDATE',
@@ -445,24 +453,24 @@ async function ingestInventory(agent, payload) {
     await client.query(
       `UPDATE rmm_device_inventory SET
          name=$2,
-         platform='Windows',
-         operating_system=$3,
-         os_version=$4,
-         manufacturer=$5,
-         model=$6,
-         serial_number=$7,
-         memory_bytes=$8,
-         storage_total_bytes=$9,
-         storage_free_bytes=$10,
+         platform=$3,
+         operating_system=$4,
+         os_version=$5,
+         manufacturer=$6,
+         model=$7,
+         serial_number=$8,
+         memory_bytes=$9,
+         storage_total_bytes=$10,
+         storage_free_bytes=$11,
          management_state='managed',
          management_agent='Hi5Central Agent',
-         source_last_sync_at=$11::timestamptz,
+         source_last_sync_at=$12::timestamptz,
          last_imported_at=now(),
          active=true,
-         source_payload=$12::jsonb,
+         source_payload=$13::jsonb,
          updated_at=now()
        WHERE id=$1`,
-      [agent.inventory_id, hostname, clean(summary.operating_system || summary.os_name || os.name || 'Windows'), clean(summary.os_version || os.version), clean(hardware.manufacturer || summary.manufacturer), clean(hardware.model || summary.model), clean(hardware.serial_number || summary.serial_number), boundedInteger(memory.total_bytes ?? summary.total_memory_bytes, 0, Number.MAX_SAFE_INTEGER), storage.total, storage.free, collectedAt, JSON.stringify(effectivePayload)],
+      [agent.inventory_id, hostname, platform, operatingSystem, clean(summary.os_version || os.version), clean(hardware.manufacturer || summary.manufacturer), clean(hardware.model || summary.model), clean(hardware.serial_number || summary.serial_number), boundedInteger(memory.total_bytes ?? summary.total_memory_bytes, 0, Number.MAX_SAFE_INTEGER), storage.total, storage.free, collectedAt, JSON.stringify(effectivePayload)],
     )
     await client.query(
       `UPDATE rmm_agent_devices SET
@@ -474,7 +482,9 @@ async function ingestInventory(agent, payload) {
       [agent.id, clean(agentInfo.version), collectedAt],
     )
 
-    await ingestWindowsUpdateInventory(agent, effectivePayload, client)
+    if (platform === 'Windows') {
+      await ingestWindowsUpdateInventory(agent, effectivePayload, client)
+    }
 
     for (const event of inventoryDeltaEvents(previousPayload, effectivePayload)) {
       await recordRmmActivity({
@@ -788,8 +798,8 @@ export function registerRmmAgentRoutes(app) {
     const body = await c.req.json().catch(() => ({}))
     const enrollmentToken = clean(body.enrollmentToken || body.enrollment_token)
     if (!enrollmentToken || enrollmentToken.length > 200) return c.json({ success: false, error: 'A valid enrollment token is required.' }, 400)
-    const hostname = clean(body.hostname).slice(0, 255) || 'Windows device'
-    const platform = clean(body.platform).slice(0, 50) || 'windows'
+    const platform = canonicalAgentPlatform(clean(body.platform).slice(0, 50) || 'windows')
+    const hostname = clean(body.hostname).slice(0, 255) || (platform + ' device')
     const architecture = clean(body.architecture).slice(0, 50)
     const agentVersion = clean(body.agentVersion || body.agent_version).slice(0, 80)
     const fingerprint = clean(body.fingerprint || body.device_fingerprint).slice(0, 255)
@@ -815,9 +825,9 @@ export function registerRmmAgentRoutes(app) {
         `INSERT INTO rmm_device_inventory
            (tenant_id,source,source_device_id,reference,name,platform,operating_system,
             management_state,management_agent,enrolled_at,source_last_sync_at,active,source_payload)
-         VALUES ($1,'hi5central_agent',$2,$3,$4,$5,'Windows','managed','Hi5Central Agent',now(),now(),true,$6::jsonb)
+         VALUES ($1,'hi5central_agent',$2,$3,$4,$5,$6,'managed','Hi5Central Agent',now(),now(),true,$7::jsonb)
          RETURNING id`,
-        [pkg.tenant_id, deviceId, reference, hostname, platform, JSON.stringify({ enrollment: { architecture, agentVersion, fingerprint } })],
+        [pkg.tenant_id, deviceId, reference, hostname, platform, platform, JSON.stringify({ enrollment: { architecture, agentVersion, fingerprint, platform } })],
       )
       await client.query(
         `INSERT INTO rmm_agent_devices
@@ -871,6 +881,19 @@ export function registerRmmAgentRoutes(app) {
     await pool.query(`UPDATE rmm_device_inventory SET source_last_sync_at=now(),last_imported_at=now(),updated_at=now() WHERE id=$1`, [agent.inventory_id])
     return c.json({ success: true })
   })
+
+  app.post('/api/v1/agent/devices/inventory', async (c) => {
+    const agent = await authenticateAgent(c.req.header('x-hi5-device-id'), c.req.header('x-hi5-agent-secret'))
+    if (!agent) return c.json({ success: false, error: 'Agent authentication failed.' }, 401)
+    const body = await c.req.json().catch(() => ({}))
+    if (!body || typeof body !== 'object') return c.json({ success: false, error: 'Inventory payload is required.' }, 400)
+    if (clean(body.device_id) && clean(body.device_id) !== String(agent.id)) {
+      return c.json({ success: false, error: 'Inventory device identity does not match authentication.' }, 409)
+    }
+    await ingestInventory(agent, body)
+    return c.json({ success: true })
+  })
+
   app.get('/api/v1/agent/devices/jobs', async (c) => {
     const agent = await authenticateAgent(c.req.header('x-hi5-device-id'), c.req.header('x-hi5-agent-secret'))
     if (!agent) return c.json({ success: false, error: 'Agent authentication failed.' }, 401)
