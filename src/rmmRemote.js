@@ -9,7 +9,10 @@ import { recordRmmActivity } from './rmmActivity.js'
 import { resolveSession } from './session.js'
 
 const ROOT_DOMAIN = deployment.rootDomain
-const VIEWER_DOWNLOAD_URL = process.env.VIEWER_DOWNLOAD_URL || `https://downloads.${ROOT_DOMAIN}/viewer/latest/Hi5CentralViewerSetup.exe`
+const DOWNLOADS_URL = String(process.env.DOWNLOADS_URL || `https://downloads.${ROOT_DOMAIN}`).replace(/\/$/, '')
+const VIEWER_DOWNLOAD_URL_WINDOWS = process.env.VIEWER_DOWNLOAD_URL_WINDOWS || process.env.VIEWER_DOWNLOAD_URL || `${DOWNLOADS_URL}/viewer/latest/Hi5CentralViewerSetup.exe`
+const VIEWER_DOWNLOAD_URL_MACOS = process.env.VIEWER_DOWNLOAD_URL_MACOS || `${DOWNLOADS_URL}/viewer/latest/Hi5CentralViewer-macOS.dmg`
+const VIEWER_DOWNLOAD_URL_LINUX = process.env.VIEWER_DOWNLOAD_URL_LINUX || `${DOWNLOADS_URL}/viewer/latest/hi5central-viewer_amd64.deb`
 const VIEWER_WS_URL = process.env.VIEWER_WS_URL || `wss://rmm.${ROOT_DOMAIN}/viewer/ws`
 const TURN_HOST = process.env.TURN_HOST || `turn.${ROOT_DOMAIN}`
 const TURN_SHARED_SECRET_FILE = process.env.TURN_SHARED_SECRET_FILE || '/run/secrets/turn_shared_secret'
@@ -47,6 +50,26 @@ function viewerClientForRequest(c, requestedClient = '') {
   if (requested === 'browser' || requested === 'native') return requested
   const mobileHint = clean(c.req.header('sec-ch-ua-mobile')).toLowerCase()
   return mobileHint === '?1' || isPortableUserAgent(c.req.header('user-agent')) ? 'browser' : 'native'
+}
+
+function viewerPlatformForRequest(c, requestedPlatform = '') {
+  const requested = clean(requestedPlatform).toLowerCase()
+  if (['windows', 'macos', 'linux'].includes(requested)) return requested
+
+  const platformHint = clean(c.req.header('sec-ch-ua-platform')).replace(/^"|"$/g, '').toLowerCase()
+  const userAgent = clean(c.req.header('user-agent')).toLowerCase()
+  const combined = `${platformHint} ${userAgent}`
+  if (/windows|win32|win64/.test(combined)) return 'windows'
+  if (/macos|macintosh|mac os x/.test(combined)) return 'macos'
+  if (/linux|x11|ubuntu|fedora|debian/.test(combined) && !/android/.test(combined)) return 'linux'
+  return 'unknown'
+}
+
+function viewerDownloadUrlForPlatform(platform = '') {
+  if (platform === 'macos') return VIEWER_DOWNLOAD_URL_MACOS
+  if (platform === 'linux') return VIEWER_DOWNLOAD_URL_LINUX
+  if (platform === 'windows') return VIEWER_DOWNLOAD_URL_WINDOWS
+  return null
 }
 function safeSend(ws, payload) {
   if (!ws || ws.readyState !== 1) return false
@@ -122,6 +145,7 @@ function browserLaunchUrl(slug, payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
     ice,
   })
   const base = tenantUrls(slug, { rmm: true }).rmmUrl || `https://${slug}-rmm.${ROOT_DOMAIN}`
@@ -135,6 +159,7 @@ function nativeLaunchUrl(payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
   })
   return `hi5central-viewer://connect?${query.toString()}`
 }
@@ -223,6 +248,7 @@ export function registerRmmRemoteRoutes(app) {
     })
 
     const viewerClient = viewerClientForRequest(c, body.viewerClient)
+    const viewerPlatform = viewerClient === 'native' ? viewerPlatformForRequest(c, body.viewerPlatform) : 'browser'
     const sessionId = randomUUID()
     const token = randomSecret('h5v')
     const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000)
@@ -240,15 +266,17 @@ export function registerRmmRemoteRoutes(app) {
       token,
       wssUrl: VIEWER_WS_URL,
       mode,
+      sessionType: 'unattended',
       iceServers: ice.viewer,
     }
     return c.json({
       session: { id: sessionId, mode, expiresAt: expiresAt.toISOString(), deviceName: agent.name, reference: agent.reference },
       connection,
       viewerClient,
+      viewerPlatform,
       browserUrl: viewerClient === 'browser' ? browserLaunchUrl(auth.session.slug, connection) : null,
       nativeUrl: viewerClient === 'native' ? nativeLaunchUrl(connection) : null,
-      viewerDownloadUrl: viewerClient === 'native' ? VIEWER_DOWNLOAD_URL : null,
+      viewerDownloadUrl: viewerClient === 'native' ? viewerDownloadUrlForPlatform(viewerPlatform) : null,
     }, 201)
   })
 
