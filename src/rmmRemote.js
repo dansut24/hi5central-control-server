@@ -432,10 +432,10 @@ export function attachRmmViewerWebSocket(server) {
       url.searchParams.get('session_id'),
       url.searchParams.get('device_id'),
       url.searchParams.get('token'),
-    )
+    ).catch(() => null)
     if (viewerSession) {
       viewerSession.viewer_version = clean(url.searchParams.get('viewer_version'))
-    }.catch(() => null)
+    }
     if (viewerSession?.viewer_client === 'browser') {
       const requestedClient = clean(url.searchParams.get('client')).toLowerCase()
       // The session itself already authorises the browser Viewer. Do not
