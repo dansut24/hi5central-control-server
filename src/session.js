@@ -233,7 +233,10 @@ export function sessionPayload(session) {
       tenantUrl: session.tenant_url,
       portalUrl: session.portal_url,
       rmmUrl: session.rmm_url,
-      modules: session.modules || {},
+      modules: {
+        ...(session.modules || {}),
+        selfService: Boolean(session.modules?.itsm),
+      },
     },
     onboarding: { step: session.onboarding_step, completedAt: session.onboarding_completed_at, data: session.onboarding_data || {} },
     security: { mfaVerified: Boolean(session.mfa_verified_at) },
