@@ -232,7 +232,7 @@ function agentUpgradeScript(release) {
   ].join("\n")
 }
 
-function portableAgentUpgradeScript(release, platformValue, correlationId) {
+export function portableAgentUpgradeScript(release, platformValue, correlationId) {
   const platform = canonicalAgentPlatform(platformValue)
   const version = clean(release.version).replace(/[^0-9A-Za-z._-]/g, '').slice(0, 48)
   const expected = clean(release.installer_sha256).toLowerCase()
