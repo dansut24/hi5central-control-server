@@ -1229,6 +1229,42 @@ export function registerRmmAgentRoutes(app) {
     const success = Boolean(body.success)
     const resultPayload = body.result && typeof body.result === 'object' ? body.result : {}
     const errorMessage = clean(body.error).slice(0, 2000) || null
+
+    if (success && clean(resultPayload.status).toLowerCase() === 'scheduled') {
+      const staged = await pool.query(
+        `UPDATE rmm_agent_jobs
+            SET result=$4::jsonb,error_message=NULL,updated_at=now()
+          WHERE id=$1 AND agent_device_id=$2 AND tenant_id=$3
+            AND status IN ('claimed','queued')
+            AND request_metadata->>'source'='agent_upgrade'
+          RETURNING id,tenant_id,agent_device_id,queued_by_user_id,initiated_by_label,
+                    correlation_id,request_metadata,result`,
+        [clean(c.req.param('jobId')), agent.id, agent.tenant_id, JSON.stringify(resultPayload)],
+      )
+      if (staged.rowCount) {
+        const stagedJob = staged.rows[0]
+        const actorLabel = clean(stagedJob.initiated_by_label || 'Technician')
+        await recordRmmActivity({
+          tenantId: stagedJob.tenant_id,
+          agentDeviceId: stagedJob.agent_device_id,
+          inventoryId: agent.inventory_id,
+          actorUserId: stagedJob.queued_by_user_id,
+          actorType: 'technician',
+          actorLabel,
+          eventType: 'agent.upgrade.staged',
+          category: 'device',
+          summary: actorLabel + ' staged Hi5Central Agent ' + clean(stagedJob.request_metadata?.release_version) + ' upgrade',
+          detail: 'Waiting for the Agent service to restart and report the target version.',
+          outcome: 'info',
+          jobId: stagedJob.id,
+          correlationId: stagedJob.correlation_id,
+          metadata: { ...object(stagedJob.request_metadata), preparation: resultPayload },
+        }).catch(() => {})
+        await pool.query(`UPDATE rmm_agent_devices SET last_authenticated_at=now(),updated_at=now() WHERE id=$1`, [agent.id])
+        return c.json({ success: true, staged: true })
+      }
+    }
+
     const result = await pool.query(
       `UPDATE rmm_agent_jobs
           SET status=$4,result=$5::jsonb,error_message=$6,completed_at=now(),updated_at=now()
