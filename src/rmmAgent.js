@@ -384,7 +384,7 @@ export function portableAgentUpgradeScript(release, platformValue, correlationId
       'printf "%s\\n" ' + shellSingleQuote(runnerContent) + ' > "$runner"',
       'chmod 0700 "$runner"',
       'printf "%s\\n" ' + shellSingleQuote(plistContent) + ' > "$plist"',
-      '/usr/bin/chown root:wheel "$plist"',
+      '/usr/sbin/chown root:wheel "$plist"',
       'chmod 0644 "$plist"',
       '/usr/bin/plutil -lint "$plist" >/dev/null',
       '/bin/launchctl bootstrap system "$plist"',
