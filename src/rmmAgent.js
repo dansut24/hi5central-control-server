@@ -797,7 +797,7 @@ export function registerRmmAgentRoutes(app) {
     const [deviceResult, releases, jobResult] = await Promise.all([
       pool.query(
         `SELECT a.id,a.inventory_id,a.agent_version,a.websocket_status,a.last_telemetry_at,
-                a.patch_capabilities,a.patch_capabilities_at,i.name,i.reference
+                a.patch_capabilities,a.patch_capabilities_at,i.name,i.reference,i.platform,i.operating_system
            FROM rmm_agent_devices a
            JOIN rmm_device_inventory i ON i.id=a.inventory_id
           WHERE a.id=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true
@@ -816,6 +816,8 @@ export function registerRmmAgentRoutes(app) {
     ])
     const device = deviceResult.rows[0]
     if (!device) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+    const platform = canonicalAgentPlatform(device.platform || device.operating_system)
+    const compatibleReleases = releases.filter((release) => releaseMatchesPlatform(release, platform))
     const capabilities = object(device.patch_capabilities)
     const patchHostVersion = clean(capabilities.patchHostVersion || capabilities.version)
     const online = Boolean(agentSocketForDevice(device.id)?.readyState === 1)
@@ -830,8 +832,9 @@ export function registerRmmAgentRoutes(app) {
         websocketStatus: device.websocket_status,
         lastTelemetryAt: device.last_telemetry_at,
         patchCapabilitiesAt: device.patch_capabilities_at,
+        platform,
       },
-      releases: releases.map((release) => ({
+      releases: compatibleReleases.map((release) => ({
         id: release.id,
         channel: release.channel,
         version: release.version,
