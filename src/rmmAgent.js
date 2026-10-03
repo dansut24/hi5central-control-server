@@ -230,6 +230,135 @@ function agentUpgradeScript(release) {
   ].join("\n")
 }
 
+function portableAgentUpgradeScript(release, platformValue, correlationId) {
+  const platform = canonicalAgentPlatform(platformValue)
+  const version = clean(release.version).replace(/[^0-9A-Za-z._-]/g, '').slice(0, 48)
+  const expected = clean(release.installer_sha256).toLowerCase()
+  const url = clean(release.installer_url)
+  const token = clean(correlationId).replace(/[^0-9A-Za-z]/g, '').slice(0, 16) || randomUUID().replaceAll('-', '').slice(0, 16)
+
+  if (!version || !/^[a-f0-9]{64}$/.test(expected)) {
+    throw new Error('Portable Agent release metadata is incomplete.')
+  }
+
+  if (platform === 'Linux') {
+    const stage = '/var/lib/hi5central/agent/upgrade/' + version + '-' + token
+    const runner = stage + '/run-upgrade.sh'
+    const runnerLog = stage + '/upgrade.log'
+    const unit = 'hi5central-agent-upgrade-' + version.replaceAll('.', '-') + '-' + token.toLowerCase()
+    const runnerContent = [
+      '#!/usr/bin/env bash',
+      'set -u',
+      'sleep 2',
+      'stage=' + shellSingleQuote(stage),
+      'log=' + shellSingleQuote(runnerLog),
+      'exec >>"$log" 2>&1',
+      'echo "Hi5Central Agent upgrade starting at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+      'if /bin/bash "$stage/installer/linux/install.sh" --api-base https://api.hi5central.com; then',
+      '  echo "Hi5Central Agent upgrade completed successfully"',
+      '  exit 0',
+      'fi',
+      'rc=$?',
+      'echo "Hi5Central Agent upgrade failed with exit code $rc"',
+      'exit "$rc"',
+    ].join('\n')
+
+    return [
+      'set -eu',
+      'url=' + shellSingleQuote(url),
+      'expected=' + shellSingleQuote(expected),
+      'version=' + shellSingleQuote(version),
+      'stage=' + shellSingleQuote(stage),
+      'archive="$stage/agent.tar.gz"',
+      'runner=' + shellSingleQuote(runner),
+      'rm -rf "$stage"',
+      'mkdir -p "$stage"',
+      '/usr/bin/curl --fail --location --silent --show-error --proto "=https" --tlsv1.2 "$url" -o "$archive"',
+      'actual=$(/usr/bin/sha256sum "$archive" | /usr/bin/awk \'{print $1}\')',
+      'if [ "$actual" != "$expected" ]; then rm -f "$archive"; echo "Agent archive SHA-256 mismatch" >&2; exit 42; fi',
+      '/bin/tar -xzf "$archive" -C "$stage"',
+      'chmod 0755 "$stage/Hi5CentralAgent" "$stage/installer/linux/install.sh"',
+      'candidate=$("$stage/Hi5CentralAgent" --version)',
+      'if [ "$candidate" != "$version" ]; then echo "Agent version verification failed: expected $version got $candidate" >&2; exit 43; fi',
+      'printf "%s\\n" ' + shellSingleQuote(runnerContent) + ' > "$runner"',
+      'chmod 0700 "$runner"',
+      'if [ ! -x /usr/bin/systemd-run ] && [ ! -x /bin/systemd-run ]; then echo "systemd-run is required for an in-place Agent upgrade" >&2; exit 44; fi',
+      'SYSTEMD_RUN=/usr/bin/systemd-run; [ -x "$SYSTEMD_RUN" ] || SYSTEMD_RUN=/bin/systemd-run',
+      '"$SYSTEMD_RUN" --unit=' + shellSingleQuote(unit) + ' --property=Type=oneshot /bin/bash "$runner" >/dev/null',
+      'printf "%s\\n" ' + shellSingleQuote(JSON.stringify({ status: 'scheduled', transport: 'systemd', target_version: version })) ,
+    ].join('\n')
+  }
+
+  if (platform === 'macOS') {
+    const stage = '/Library/Application Support/Hi5Central/Agent/upgrade/' + version + '-' + token
+    const runner = stage + '/run-upgrade.sh'
+    const runnerLog = stage + '/upgrade.log'
+    const label = 'com.hi5central.agent.upgrade.' + version.replaceAll('.', '-') + '.' + token.toLowerCase()
+    const plist = '/Library/LaunchDaemons/' + label + '.plist'
+    const runnerContent = [
+      '#!/bin/bash',
+      'set -u',
+      'sleep 2',
+      'stage=' + shellSingleQuote(stage),
+      'plist=' + shellSingleQuote(plist),
+      'log=' + shellSingleQuote(runnerLog),
+      'exec >>"$log" 2>&1',
+      'echo "Hi5Central Agent upgrade starting at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+      'rc=0',
+      '/bin/bash "$stage/installer/macos/install.sh" --api-base https://api.hi5central.com || rc=$?',
+      'rm -f "$plist"',
+      'if [ "$rc" -eq 0 ]; then echo "Hi5Central Agent upgrade completed successfully"; else echo "Hi5Central Agent upgrade failed with exit code $rc"; fi',
+      'exit "$rc"',
+    ].join('\n')
+    const plistContent = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0">',
+      '<dict>',
+      '  <key>Label</key><string>' + label + '</string>',
+      '  <key>ProgramArguments</key>',
+      '  <array><string>/bin/bash</string><string>' + runner + '</string></array>',
+      '  <key>RunAtLoad</key><true/>',
+      '  <key>KeepAlive</key><false/>',
+      '  <key>StandardOutPath</key><string>' + runnerLog + '</string>',
+      '  <key>StandardErrorPath</key><string>' + runnerLog + '</string>',
+      '  <key>ProcessType</key><string>Background</string>',
+      '</dict>',
+      '</plist>',
+    ].join('\n')
+
+    return [
+      'set -eu',
+      'url=' + shellSingleQuote(url),
+      'expected=' + shellSingleQuote(expected),
+      'version=' + shellSingleQuote(version),
+      'stage=' + shellSingleQuote(stage),
+      'archive="$stage/agent.tar.gz"',
+      'runner=' + shellSingleQuote(runner),
+      'plist=' + shellSingleQuote(plist),
+      'rm -rf "$stage"',
+      'mkdir -p "$stage"',
+      '/usr/bin/curl --fail --location --silent --show-error --proto "=https" --tlsv1.2 "$url" -o "$archive"',
+      'actual=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk \'{print $1}\')',
+      'if [ "$actual" != "$expected" ]; then rm -f "$archive"; echo "Agent archive SHA-256 mismatch" >&2; exit 42; fi',
+      '/usr/bin/tar -xzf "$archive" -C "$stage"',
+      'chmod 0755 "$stage/Hi5CentralAgent" "$stage/installer/macos/install.sh"',
+      'candidate=$("$stage/Hi5CentralAgent" --version)',
+      'if [ "$candidate" != "$version" ]; then echo "Agent version verification failed: expected $version got $candidate" >&2; exit 43; fi',
+      'printf "%s\\n" ' + shellSingleQuote(runnerContent) + ' > "$runner"',
+      'chmod 0700 "$runner"',
+      'printf "%s\\n" ' + shellSingleQuote(plistContent) + ' > "$plist"',
+      '/usr/bin/chown root:wheel "$plist"',
+      'chmod 0644 "$plist"',
+      '/usr/bin/plutil -lint "$plist" >/dev/null',
+      '/bin/launchctl bootstrap system "$plist"',
+      'printf "%s\\n" ' + shellSingleQuote(JSON.stringify({ status: 'scheduled', transport: 'launchd', target_version: version })),
+    ].join('\n')
+  }
+
+  throw new Error('Portable Agent self-update is supported only on macOS and Linux.')
+}
+
 async function agentReleaseRows(platform = 'Windows') {
   await syncPortableAgentReleases().catch((error) => {
     console.error('Portable Agent release sync failed', error.message)
