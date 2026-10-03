@@ -18,6 +18,10 @@ import { resolveSession } from './session.js'
 const AGENT_DOWNLOAD_URL = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe'
 const AGENT_DOWNLOAD_URL_LINUX = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-linux-x64.tar.gz'
 const AGENT_DOWNLOAD_URL_MACOS = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-macOS-universal.tar.gz'
+const PORTABLE_AGENT_RELEASE_MANIFEST_URL = process.env.PORTABLE_AGENT_RELEASE_MANIFEST_URL || 'https://downloads.hi5central.com/agent/latest/portable-manifest.json'
+const PORTABLE_AGENT_RELEASE_CACHE_MS = 60_000
+let portableAgentReleaseSyncAt = 0
+let portableAgentReleaseSyncPromise = null
 const MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 const AGENT_BROKER_INSTANCE_ID = String(process.env.API_INSTANCE_ID || process.env.HOSTNAME || `api-${process.pid}`) + '-' + randomUUID().slice(0, 8)
 const AGENT_BROKER_OWNER_HASH = 'hi5central:rmm:agent:owners'
@@ -77,6 +81,75 @@ function patchHostVersionAtLeast(currentValue, targetValue) {
   const target = clean(targetValue)
   if (!target) return true
   return Boolean(current && versionCompare(current, target) >= 0)
+}
+
+function portableReleaseChannel(platformValue = '') {
+  const platform = canonicalAgentPlatform(platformValue)
+  if (platform === 'Linux') return 'portable-linux'
+  if (platform === 'macOS') return 'portable-macos'
+  return ''
+}
+
+function releaseMatchesPlatform(release, platformValue = '') {
+  const channel = clean(release?.channel).toLowerCase()
+  const portableChannel = portableReleaseChannel(platformValue)
+  if (portableChannel) return channel === portableChannel
+  return !channel.startsWith('portable-')
+}
+
+async function syncPortableAgentReleases(force = false) {
+  if (!force && Date.now() - portableAgentReleaseSyncAt < PORTABLE_AGENT_RELEASE_CACHE_MS) return
+  if (portableAgentReleaseSyncPromise) return portableAgentReleaseSyncPromise
+
+  portableAgentReleaseSyncPromise = (async () => {
+    try {
+      const response = await fetch(PORTABLE_AGENT_RELEASE_MANIFEST_URL, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(4_000),
+      })
+      if (!response.ok) throw new Error('Portable Agent release manifest HTTP ' + response.status)
+      const manifest = await response.json()
+      const platforms = object(manifest?.platforms)
+
+      const definitions = [
+        { key: 'linux', channel: 'portable-linux', expectedUrl: AGENT_DOWNLOAD_URL_LINUX, label: 'Linux x64' },
+        { key: 'macos', channel: 'portable-macos', expectedUrl: AGENT_DOWNLOAD_URL_MACOS, label: 'macOS universal' },
+      ]
+
+      for (const definition of definitions) {
+        const item = object(platforms[definition.key])
+        const version = clean(item.version).slice(0, 80)
+        const installerUrl = clean(item.url)
+        const installerSha256 = clean(item.sha256).toLowerCase()
+        if (!/^0\.3\.\d+(?:[-+][0-9A-Za-z._-]+)?$/.test(version)) continue
+        if (installerUrl !== definition.expectedUrl) continue
+        if (!/^[a-f0-9]{64}$/.test(installerSha256)) continue
+
+        await pool.query(
+          `INSERT INTO rmm_agent_releases
+            (channel,version,patch_host_version,installer_url,installer_sha256,build_commit,workflow_run,status,release_notes)
+           VALUES ($1,$2,'',$3,$4,'',NULL,'test',$5)
+           ON CONFLICT (channel,version) DO UPDATE
+             SET installer_url=EXCLUDED.installer_url,
+                 installer_sha256=EXCLUDED.installer_sha256,
+                 release_notes=EXCLUDED.release_notes,
+                 updated_at=now()`,
+          [
+            definition.channel,
+            version,
+            installerUrl,
+            installerSha256,
+            definition.label + ' portable Agent · portal/self-update capable',
+          ],
+        )
+      }
+    } finally {
+      portableAgentReleaseSyncAt = Date.now()
+      portableAgentReleaseSyncPromise = null
+    }
+  })()
+
+  return portableAgentReleaseSyncPromise
 }
 async function reconcileAgentUpgradeAfterHello(agent, reportedVersion) {
   const pending = await pool.query(`SELECT id,request_metadata,initiated_by_label,queued_by_user_id,correlation_id FROM rmm_agent_jobs WHERE tenant_id=$1 AND agent_device_id=$2 AND request_metadata->>'source'='agent_upgrade' AND status IN ('queued','claimed') ORDER BY created_at DESC LIMIT 1`, [agent.tenant_id, agent.id])
@@ -157,7 +230,10 @@ function agentUpgradeScript(release) {
   ].join("\n")
 }
 
-async function agentReleaseRows() {
+async function agentReleaseRows(platform = 'Windows') {
+  await syncPortableAgentReleases().catch((error) => {
+    console.error('Portable Agent release sync failed', error.message)
+  })
   const result = await pool.query(
     `SELECT id,channel,version,patch_host_version,installer_url,installer_sha256,
             build_commit,workflow_run,status,release_notes,created_at,updated_at
@@ -165,7 +241,7 @@ async function agentReleaseRows() {
       WHERE status IN ('test','active')
       ORDER BY status='active' DESC,created_at DESC,version DESC`,
   )
-  return result.rows
+  return result.rows.filter((release) => releaseMatchesPlatform(release, platform))
 }
 
 export async function authenticateAgent(deviceId, deviceSecret) {
