@@ -421,11 +421,11 @@ export function registerRmmDeviceToolRoutes(app) {
       ? (requestedRunAs === 'system' ? 'root' : requestedRunAs)
       : requestedRunAs
 
-    if (isUnix && !versionAtLeast(device.agent_version, '0.3.24')) {
+    if (isUnix && !versionAtLeast(device.agent_version, '0.3.27')) {
       return c.json({
-        error: 'Hi5Central Agent 0.3.24 or newer is required for Unix Terminal and Files.',
+        error: 'Hi5Central Agent 0.3.27 or newer is required for Unix Terminal and Files.',
         upgradeRequired: true,
-        requiredAgentVersion: '0.3.24',
+        requiredAgentVersion: '0.3.27',
       }, 426)
     }
 
