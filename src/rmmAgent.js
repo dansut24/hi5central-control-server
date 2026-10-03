@@ -91,8 +91,10 @@ function portableReleaseChannel(platformValue = '') {
 }
 
 function releaseMatchesPlatform(release, platformValue = '') {
+  const rawPlatform = clean(platformValue)
+  if (!rawPlatform) return true
   const channel = clean(release?.channel).toLowerCase()
-  const portableChannel = portableReleaseChannel(platformValue)
+  const portableChannel = portableReleaseChannel(rawPlatform)
   if (portableChannel) return channel === portableChannel
   return !channel.startsWith('portable-')
 }
@@ -359,7 +361,7 @@ function portableAgentUpgradeScript(release, platformValue, correlationId) {
   throw new Error('Portable Agent self-update is supported only on macOS and Linux.')
 }
 
-async function agentReleaseRows(platform = 'Windows') {
+async function agentReleaseRows(platform = '') {
   await syncPortableAgentReleases().catch((error) => {
     console.error('Portable Agent release sync failed', error.message)
   })
