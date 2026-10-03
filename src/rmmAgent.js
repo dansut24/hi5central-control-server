@@ -154,11 +154,45 @@ async function syncPortableAgentReleases(force = false) {
   return portableAgentReleaseSyncPromise
 }
 async function reconcileAgentUpgradeAfterHello(agent, reportedVersion) {
-  const pending = await pool.query(`SELECT id,request_metadata,initiated_by_label,queued_by_user_id,correlation_id FROM rmm_agent_jobs WHERE tenant_id=$1 AND agent_device_id=$2 AND request_metadata->>'source'='agent_upgrade' AND status IN ('queued','claimed') ORDER BY created_at DESC LIMIT 1`, [agent.tenant_id, agent.id])
+  const pending = await pool.query(`SELECT id,request_metadata,result,initiated_by_label,queued_by_user_id,correlation_id FROM rmm_agent_jobs WHERE tenant_id=$1 AND agent_device_id=$2 AND request_metadata->>'source'='agent_upgrade' AND status IN ('queued','claimed') ORDER BY created_at DESC LIMIT 1`, [agent.tenant_id, agent.id])
   const job = pending.rows[0]
   if (!job) return
   const target = clean(object(job.request_metadata).release_version)
-  if (!target || !agentReleaseVersionAtLeast(reportedVersion, target)) return
+  if (!target) return
+  if (!agentReleaseVersionAtLeast(reportedVersion, target)) {
+    if (clean(object(job.result).status).toLowerCase() === 'scheduled') {
+      const failed = await pool.query(
+        `UPDATE rmm_agent_jobs
+            SET status='failed',
+                error_message=$3,
+                completed_at=now(),
+                updated_at=now()
+          WHERE id=$1 AND tenant_id=$2 AND status IN ('queued','claimed')
+          RETURNING id`,
+        [job.id, agent.tenant_id, 'Agent reconnected on version ' + clean(reportedVersion || 'unknown') + ' instead of target ' + target + '; upgrade rollback/failure detected.'],
+      )
+      if (failed.rowCount) {
+        const actor = clean(job.initiated_by_label || 'Technician')
+        await recordRmmActivity({
+          tenantId: agent.tenant_id,
+          agentDeviceId: agent.id,
+          inventoryId: agent.inventory_id,
+          actorUserId: job.queued_by_user_id,
+          actorType: 'technician',
+          actorLabel: actor,
+          eventType: 'agent.upgrade.failed',
+          category: 'device',
+          summary: actor + ' Agent upgrade to ' + target + ' rolled back or failed',
+          detail: 'Endpoint reconnected on Agent ' + clean(reportedVersion || 'unknown') + '.',
+          outcome: 'failed',
+          jobId: job.id,
+          correlationId: job.correlation_id,
+          metadata: { targetVersion: target, reportedVersion, verification: 'agent_reconnect_version_mismatch' },
+        }).catch(() => {})
+      }
+    }
+    return
+  }
   const updated = await pool.query(`UPDATE rmm_agent_jobs SET status='completed',result=jsonb_build_object('status','succeeded_after_reconnect','reportedAgentVersion',$3),error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$1 AND tenant_id=$2 AND status IN ('queued','claimed') RETURNING id`, [job.id, agent.tenant_id, reportedVersion])
   if (!updated.rowCount) return
   const actor = clean(job.initiated_by_label || 'Technician')
