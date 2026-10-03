@@ -586,9 +586,9 @@ async function ensureWindowsUpdateManagement(tenantId, device, policy, state, op
 export async function evaluateWindowsUpdatePolicies(tenantId, options = {}) {
   const [devices, controlResult, managementResult] = await Promise.all([
     pool.query(
-      'SELECT a.id AS agent_device_id,a.inventory_id,a.agent_version,a.websocket_status,a.last_telemetry_at,i.name,i.reference ' +
+      'SELECT a.id AS agent_device_id,a.inventory_id,a.agent_version,a.websocket_status,a.last_telemetry_at,i.name,i.reference,i.platform ' +
       'FROM rmm_agent_devices a JOIN rmm_device_inventory i ON i.id=a.inventory_id AND i.active=true ' +
-      'WHERE a.tenant_id=$1 AND a.disabled_at IS NULL',
+      "WHERE a.tenant_id=$1 AND a.disabled_at IS NULL AND lower(COALESCE(i.platform,''))='windows'",
       [tenantId],
     ),
     pool.query(
