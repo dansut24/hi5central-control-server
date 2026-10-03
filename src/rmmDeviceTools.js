@@ -119,7 +119,7 @@ function payloadForAction(type, body = {}) {
 
 async function managedAgent(tenantId, agentDeviceId) {
   const result = await pool.query(
-    "SELECT a.id,a.agent_version,i.id AS inventory_id,i.name,i.reference " +
+    "SELECT a.id,a.agent_version,i.id AS inventory_id,i.name,i.reference,i.platform,i.operating_system " +
     "FROM rmm_agent_devices a " +
     "JOIN rmm_device_inventory i ON i.id=a.inventory_id " +
     "WHERE a.id::text=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true LIMIT 1",
@@ -414,10 +414,30 @@ export function registerRmmDeviceToolRoutes(app) {
     const body = await c.req.json().catch(() => ({}))
     const tool = clean(body.tool || 'terminal').toLowerCase()
     const shell = clean(body.shell || 'powershell').toLowerCase()
-    const runAs = clean(body.runAs || body.run_as || 'system').toLowerCase()
+    const requestedRunAs = clean(body.runAs || body.run_as || 'system').toLowerCase()
+    const platform = clean(device.platform || device.operating_system).toLowerCase()
+    const isUnix = platform.includes('linux') || platform.includes('mac')
+    const runAs = isUnix
+      ? (requestedRunAs === 'system' ? 'root' : requestedRunAs)
+      : requestedRunAs
+
     if (!['terminal', 'files'].includes(tool)) return c.json({ error: 'Unsupported live tool session.' }, 400)
-    if (tool === 'terminal' && !['cmd', 'powershell'].includes(shell)) return c.json({ error: 'Terminal shell must be cmd or powershell.' }, 400)
-    if (tool === 'terminal' && !['system', 'user'].includes(runAs)) return c.json({ error: 'Terminal execution context must be user or system.' }, 400)
+
+    if (tool === 'terminal') {
+      if (isUnix && !['shell', 'bash', 'zsh', 'sh'].includes(shell)) {
+        return c.json({ error: 'Unix terminal shell must be shell, bash, zsh or sh.' }, 400)
+      }
+      if (!isUnix && !['cmd', 'powershell'].includes(shell)) {
+        return c.json({ error: 'Windows terminal shell must be cmd or powershell.' }, 400)
+      }
+    }
+
+    if (isUnix && !['root', 'user'].includes(runAs)) {
+      return c.json({ error: 'Unix execution context must be user or root.' }, 400)
+    }
+    if (!isUnix && !['system', 'user'].includes(runAs)) {
+      return c.json({ error: 'Windows execution context must be user or system.' }, 400)
+    }
 
     const id = randomUUID()
     const token = 'h5t_' + randomBytes(32).toString('base64url')
@@ -437,7 +457,7 @@ export function registerRmmDeviceToolRoutes(app) {
       deviceName: device.name,
       tool,
       shell,
-      runAs: tool === 'terminal' ? runAs : '',
+      runAs,
       tokenHash: sha256(token),
       expiresAt,
       transcript: '',
@@ -448,7 +468,7 @@ export function registerRmmDeviceToolRoutes(app) {
     const cleanup = setTimeout(() => toolSessions.delete(id), TOOL_SESSION_TTL_MS + 5000)
     cleanup.unref?.()
     return c.json({
-      session: { id, tool, shell, runAs: tool === 'terminal' ? runAs : '', deviceName: device.name, expiresAt: new Date(expiresAt).toISOString() },
+      session: { id, tool, shell, runAs, deviceName: device.name, expiresAt: new Date(expiresAt).toISOString() },
       token,
       websocketPath: '/rmm-tools/ws',
     }, 201)
@@ -519,8 +539,13 @@ export function attachRmmDeviceToolWebSocket(server) {
       "UPDATE rmm_tool_sessions SET status='active',started_at=COALESCE(started_at,now()),updated_at=now() WHERE id=$1 AND tenant_id=$2",
       [sessionId, session.tenantId],
     ).catch(() => {})
-    const toolLabel = isTerminal ? (session.shell === 'cmd' ? 'Command Prompt' : 'PowerShell') : 'File Browser'
-    const terminalContextLabel = session.runAs === 'user' ? 'signed-in user' : 'SYSTEM'
+    const isUnixSession = ['shell','bash','zsh','sh'].includes(session.shell) || session.runAs === 'root'
+    const toolLabel = isTerminal
+      ? (isUnixSession ? 'Unix Shell' : (session.shell === 'cmd' ? 'Command Prompt' : 'PowerShell'))
+      : 'File Browser'
+    const executionContextLabel = session.runAs === 'user'
+      ? 'signed-in user'
+      : (session.runAs === 'root' ? 'root' : 'SYSTEM')
     recordRmmActivity({
       tenantId: session.tenantId,
       agentDeviceId: session.agentDeviceId,
@@ -530,8 +555,8 @@ export function attachRmmDeviceToolWebSocket(server) {
       actorLabel: session.actorLabel,
       eventType: isTerminal ? 'terminal.started' : 'files.session_started',
       category: isTerminal ? 'terminal' : 'files',
-      summary: session.actorLabel + ' started a ' + toolLabel + (isTerminal ? ' session as ' + terminalContextLabel : ' session'),
-      detail: isTerminal ? 'Live terminal started in the ' + terminalContextLabel + ' execution context.' : 'Live device tool session started.',
+      summary: session.actorLabel + ' started a ' + toolLabel + ' session as ' + executionContextLabel,
+      detail: 'Live ' + (isTerminal ? 'terminal' : 'file browser') + ' started in the ' + executionContextLabel + ' execution context.',
       outcome: 'success',
       toolSessionId: sessionId,
       metadata: { tool: session.tool, shell: session.shell, runAs: session.runAs || '' },
@@ -674,6 +699,8 @@ export function attachRmmDeviceToolWebSocket(server) {
         outgoing.rows = boundedInteger(payload.rows, 5, 100) || 32
       }
       if (isFiles) {
+        outgoing.run_as = session.runAs || 'system'
+        outgoing.runAs = session.runAs || 'system'
         if (outgoing.path != null) outgoing.path = clean(outgoing.path).slice(0, 4096)
         if (outgoing.currentPath != null) outgoing.currentPath = clean(outgoing.currentPath).slice(0, 4096)
         if (outgoing.current_path != null) outgoing.current_path = clean(outgoing.current_path).slice(0, 4096)
