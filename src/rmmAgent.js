@@ -897,9 +897,13 @@ export function registerRmmAgentRoutes(app) {
     if (!isUuid(agentDeviceId)) return c.json({ error: 'A valid managed Agent ID is required.' }, 400)
     if (!isUuid(releaseId)) return c.json({ error: 'Select a trusted Agent release.' }, 400)
 
+    await syncPortableAgentReleases().catch((error) => {
+      console.error('Portable Agent release sync failed before upgrade', error.message)
+    })
+
     const [deviceResult, releaseResult, pendingResult] = await Promise.all([
       pool.query(
-        `SELECT a.id,a.inventory_id,a.agent_version,a.patch_capabilities,i.name,i.reference
+        `SELECT a.id,a.inventory_id,a.agent_version,a.patch_capabilities,i.name,i.reference,i.platform,i.operating_system
            FROM rmm_agent_devices a
            JOIN rmm_device_inventory i ON i.id=a.inventory_id
           WHERE a.id=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true
@@ -926,6 +930,11 @@ export function registerRmmAgentRoutes(app) {
     const release = releaseResult.rows[0]
     if (!device) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
     if (!release) return c.json({ error: 'Trusted Agent release not found.' }, 404)
+    const platform = canonicalAgentPlatform(device.platform || device.operating_system)
+    const portable = Boolean(portableReleaseChannel(platform))
+    if (!releaseMatchesPlatform(release, platform)) {
+      return c.json({ error: 'This Agent release is not compatible with the endpoint platform.', platform, channel: release.channel }, 409)
+    }
     if (pendingResult.rowCount) return c.json({ error: 'An Agent upgrade is already queued or running for this device.', job: pendingResult.rows[0] }, 409)
 
     let installer
@@ -946,10 +955,12 @@ export function registerRmmAgentRoutes(app) {
     const currentAgentVersion = clean(device.agent_version)
     const currentPatchHost = clean(capabilities.patchHostVersion || capabilities.version)
     const agentMeetsTarget = agentReleaseVersionAtLeast(currentAgentVersion, release.version)
-    const patchHostMeetsTarget = patchHostVersionAtLeast(currentPatchHost, release.patch_host_version)
+    const patchHostMeetsTarget = portable ? true : patchHostVersionAtLeast(currentPatchHost, release.patch_host_version)
     if (agentMeetsTarget && patchHostMeetsTarget) {
       return c.json({
-        error: 'This device already reports the target Agent and PatchHost versions or newer.',
+        error: portable
+          ? 'This device already reports the target Agent version or newer.'
+          : 'This device already reports the target Agent and PatchHost versions or newer.',
         currentAgentVersion,
         targetAgentVersion: release.version,
         currentPatchHost,
@@ -957,8 +968,15 @@ export function registerRmmAgentRoutes(app) {
       }, 409)
     }
 
-    const command = agentUpgradeScript(release)
     const correlationId = randomUUID()
+    let command
+    try {
+      command = portable
+        ? portableAgentUpgradeScript(release, platform, correlationId)
+        : agentUpgradeScript(release)
+    } catch (error) {
+      return c.json({ error: error?.message || 'Unable to prepare the Agent upgrade.' }, 409)
+    }
     const actorLabel = clean(auth.session.name || auth.session.email || 'Technician').slice(0, 255)
     const inserted = await pool.query(
       `INSERT INTO rmm_agent_jobs
@@ -969,7 +987,7 @@ export function registerRmmAgentRoutes(app) {
       [
         auth.session.tenant_id,
         device.id,
-        JSON.stringify({ command, timeout_seconds: 180 }),
+        JSON.stringify({ command, timeout_seconds: 180, run_as: portable ? 'root' : 'system' }),
         auth.session.user_id,
         actorLabel,
         correlationId,
@@ -982,6 +1000,8 @@ export function registerRmmAgentRoutes(app) {
           channel: release.channel,
           device_name: device.name,
           device_reference: device.reference,
+          platform,
+          portable,
         }),
       ],
     )
@@ -996,7 +1016,7 @@ export function registerRmmAgentRoutes(app) {
     Object.assign(job, claimed.rows[0])
     const pushed = sendAgentMessage(device.id, {
       type: 'job_execute',
-      job: { id: job.id, job_type: 'custom.command', payload: { command, timeout_seconds: 180 }, created_at: job.created_at },
+      job: { id: job.id, job_type: 'custom.command', payload: { command, timeout_seconds: 180, run_as: portable ? 'root' : 'system' }, created_at: job.created_at },
     })
     if (!pushed) {
       await pool.query(
@@ -1018,8 +1038,10 @@ export function registerRmmAgentRoutes(app) {
       actorLabel,
       eventType: 'agent.upgrade.requested',
       category: 'device',
-      summary: actorLabel + ' requested Hi5Central Agent ' + release.version + ' test upgrade',
-      detail: 'Target PatchHost ' + (release.patch_host_version || 'not specified') + ' · ' + release.channel,
+      summary: actorLabel + ' requested Hi5Central Agent ' + release.version + ' upgrade',
+      detail: portable
+        ? platform + ' portable Agent · verified SHA-256 · ' + release.channel
+        : 'Target PatchHost ' + (release.patch_host_version || 'not specified') + ' · ' + release.channel,
       outcome: 'info',
       jobId: job.id,
       correlationId,
@@ -1029,7 +1051,7 @@ export function registerRmmAgentRoutes(app) {
     return c.json({
       success: true,
       job,
-      release: { id: release.id, version: release.version, patchHostVersion: release.patch_host_version, status: release.status },
+      release: { id: release.id, version: release.version, patchHostVersion: release.patch_host_version, status: release.status, platform, portable },
     }, 202)
   })
 
