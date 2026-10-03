@@ -421,6 +421,14 @@ export function registerRmmDeviceToolRoutes(app) {
       ? (requestedRunAs === 'system' ? 'root' : requestedRunAs)
       : requestedRunAs
 
+    if (isUnix && !versionAtLeast(device.agent_version, '0.3.24')) {
+      return c.json({
+        error: 'Hi5Central Agent 0.3.24 or newer is required for Unix Terminal and Files.',
+        upgradeRequired: true,
+        requiredAgentVersion: '0.3.24',
+      }, 426)
+    }
+
     if (!['terminal', 'files'].includes(tool)) return c.json({ error: 'Unsupported live tool session.' }, 400)
 
     if (tool === 'terminal') {
