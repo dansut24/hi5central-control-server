@@ -154,7 +154,7 @@ async function syncPortableAgentReleases(force = false) {
   return portableAgentReleaseSyncPromise
 }
 async function reconcileAgentUpgradeAfterHello(agent, reportedVersion) {
-  const pending = await pool.query(`SELECT id,request_metadata,result,initiated_by_label,queued_by_user_id,correlation_id FROM rmm_agent_jobs WHERE tenant_id=$1 AND agent_device_id=$2 AND request_metadata->>'source'='agent_upgrade' AND status IN ('queued','claimed') ORDER BY created_at DESC LIMIT 1`, [agent.tenant_id, agent.id])
+  const pending = await pool.query(`SELECT id,status,request_metadata,result,initiated_by_label,queued_by_user_id,correlation_id FROM rmm_agent_jobs WHERE tenant_id=$1 AND agent_device_id=$2 AND request_metadata->>'source'='agent_upgrade' AND (status IN ('queued','claimed') OR (status='failed' AND result->>'exit_code'='143')) ORDER BY created_at DESC LIMIT 1`, [agent.tenant_id, agent.id])
   const job = pending.rows[0]
   if (!job) return
   const target = clean(object(job.request_metadata).release_version)
@@ -193,7 +193,7 @@ async function reconcileAgentUpgradeAfterHello(agent, reportedVersion) {
     }
     return
   }
-  const updated = await pool.query(`UPDATE rmm_agent_jobs SET status='completed',result=jsonb_build_object('status','succeeded_after_reconnect','reportedAgentVersion',$3),error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$1 AND tenant_id=$2 AND status IN ('queued','claimed') RETURNING id`, [job.id, agent.tenant_id, reportedVersion])
+  const updated = await pool.query(`UPDATE rmm_agent_jobs SET status='completed',result=jsonb_build_object('status','succeeded_after_reconnect','reportedAgentVersion',$3),error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$1 AND tenant_id=$2 AND (status IN ('queued','claimed') OR (status='failed' AND result->>'exit_code'='143')) RETURNING id`, [job.id, agent.tenant_id, reportedVersion])
   if (!updated.rowCount) return
   const actor = clean(job.initiated_by_label || 'Technician')
   await recordRmmActivity({ tenantId: agent.tenant_id, agentDeviceId: agent.id, inventoryId: agent.inventory_id, actorUserId: job.queued_by_user_id, actorType: 'technician', actorLabel: actor, eventType: 'agent.upgrade.completed', category: 'device', summary: actor + ' upgraded Hi5Central Agent to ' + target, detail: 'Verified after Agent reconnect · reported version ' + reportedVersion, outcome: 'success', jobId: job.id, correlationId: job.correlation_id, metadata: { targetVersion: target, reportedVersion, verification: 'agent_reconnect_hello' } })
@@ -285,7 +285,7 @@ export function portableAgentUpgradeScript(release, platformValue, correlationId
     const runnerContent = [
       '#!/usr/bin/env bash',
       'set -u',
-      'sleep 2',
+      'sleep 5',
       'stage=' + shellSingleQuote(stage),
       'log=' + shellSingleQuote(runnerLog),
       'exec >>"$log" 2>&1',
@@ -320,7 +320,7 @@ export function portableAgentUpgradeScript(release, platformValue, correlationId
       'chmod 0700 "$runner"',
       'if [ ! -x /usr/bin/systemd-run ] && [ ! -x /bin/systemd-run ]; then echo "systemd-run is required for an in-place Agent upgrade" >&2; exit 44; fi',
       'SYSTEMD_RUN=/usr/bin/systemd-run; [ -x "$SYSTEMD_RUN" ] || SYSTEMD_RUN=/bin/systemd-run',
-      '"$SYSTEMD_RUN" --unit=' + shellSingleQuote(unit) + ' --property=Type=oneshot /bin/bash "$runner" >/dev/null',
+      '"$SYSTEMD_RUN" --no-block --unit=' + shellSingleQuote(unit) + ' --property=Type=oneshot /bin/bash "$runner" >/dev/null',
       'printf "%s\\n" ' + shellSingleQuote(JSON.stringify({ status: 'scheduled', transport: 'systemd', target_version: version })) ,
     ].join('\n')
   }
@@ -334,7 +334,7 @@ export function portableAgentUpgradeScript(release, platformValue, correlationId
     const runnerContent = [
       '#!/bin/bash',
       'set -u',
-      'sleep 2',
+      'sleep 5',
       'stage=' + shellSingleQuote(stage),
       'plist=' + shellSingleQuote(plist),
       'log=' + shellSingleQuote(runnerLog),
