@@ -309,11 +309,11 @@ export function registerRmmDeviceToolRoutes(app) {
     if (type === 'software.update' && !isUnix) {
       return c.json({ error: 'Native software update actions are currently available on managed Linux/macOS endpoints only.' }, 400)
     }
-    if (isUnix && ['software.update', 'software.uninstall'].includes(type) && !versionAtLeast(device.agent_version, '0.3.32')) {
+    if (isUnix && ['software.update', 'software.uninstall'].includes(type) && !versionAtLeast(device.agent_version, '0.3.37')) {
       return c.json({
-        error: 'Hi5Central Agent 0.3.32 or newer is required for native Unix software actions.',
+        error: 'Hi5Central Agent 0.3.37 or newer is required for native Unix software actions.',
         upgradeRequired: true,
-        requiredAgentVersion: '0.3.32',
+        requiredAgentVersion: '0.3.37',
       }, 426)
     }
 
