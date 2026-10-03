@@ -104,15 +104,29 @@ function payloadForAction(type, body = {}) {
     }
     return { path, name, value, kind }
   }
-  if (type === 'software.uninstall') {
+  if (type === 'software.uninstall' || type === 'software.update') {
     const name = clean(payload.name).slice(0, 512)
-    const registryKey = clean(payload.registry_key || payload.registryKey).slice(0, 512)
+    const registryKey = clean(payload.registry_key || payload.registryKey).slice(0, 1024)
     const scope = clean(payload.scope).slice(0, 192)
     const userProfile = clean(payload.user_profile || payload.userProfile).slice(0, 1024)
-    if (!name && !registryKey) throw new Error('Software name or registry identity is required.')
-    const validScope = !scope || ['machine64', 'machine32', 'user'].includes(scope) || /^user:S-1-(?:5-21|12-1)-[0-9-]+$/i.test(scope)
+    const packageManager = clean(payload.package_manager || payload.packageManager).toLowerCase().slice(0, 64)
+    const packageId = clean(payload.package_id || payload.packageId).slice(0, 512)
+    const latestVersion = clean(payload.latest_version || payload.latestVersion).slice(0, 128)
+    if (!name && !registryKey && !packageId) throw new Error('Software name or package identity is required.')
+    const validScope = !scope || ['machine64', 'machine32', 'user', 'system'].includes(scope) || /^user:S-1-(?:5-21|12-1)-[0-9-]+$/i.test(scope)
     if (!validScope) throw new Error('Unsupported software scope.')
-    return { name, registry_key: registryKey, scope, user_profile: userProfile }
+    if (packageManager && !['apt', 'snap', 'flatpak', 'app_bundle'].includes(packageManager)) {
+      throw new Error('Unsupported native package manager.')
+    }
+    return {
+      name,
+      registry_key: registryKey,
+      scope,
+      user_profile: userProfile,
+      package_manager: packageManager,
+      package_id: packageId,
+      latest_version: latestVersion,
+    }
   }
   throw new Error('Unsupported device action.')
 }
@@ -289,6 +303,13 @@ export function registerRmmDeviceToolRoutes(app) {
 
     const device = await managedAgent(auth.session.tenant_id, agentDeviceId)
     if (!device) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+
+    const platform = clean(device.platform || device.operating_system).toLowerCase()
+    const isUnix = platform.includes('linux') || platform.includes('mac')
+    if (type === 'software.update' && !isUnix) {
+      return c.json({ error: 'Native software update actions are currently available on managed Linux/macOS endpoints only.' }, 400)
+    }
+
     const liveSocket = agentSocketForDevice(device.id)
     if (!liveSocket || liveSocket.readyState !== 1) {
       return c.json({ error: 'This device is offline. No job was queued.', offline: true }, 409)
