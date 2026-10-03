@@ -526,7 +526,7 @@ export function registerRmmAgentRoutes(app) {
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
         macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.11' },
-        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.13' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.16' },
       },
     })
   })
@@ -559,7 +559,7 @@ export function registerRmmAgentRoutes(app) {
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
         macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.11' },
-        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.13' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.16' },
       },
       installCommands: {
         windows: installCommand,
