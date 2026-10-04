@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws'
 import { hasPermission } from './access.js'
 import { deployment, originMatchesTenant, tenantUrls } from './deploymentConfig.js'
 import { pool } from './db.js'
-import { agentSocketForDevice, subscribeAgentConnections } from './rmmAgent.js'
+import { agentSocketForDevice, sendAgentMessage, subscribeAgentConnections, subscribeAgentMessages } from './rmmAgent.js'
 import { recordRmmActivity } from './rmmActivity.js'
 import { resolveSession } from './session.js'
 
@@ -21,6 +21,7 @@ const SESSION_TTL_SECONDS = 15 * 60
 const ACTIVE_RECONNECT_TTL_SECONDS = 8 * 60 * 60
 const MAX_VIEWER_PAYLOAD_BYTES = 8 * 1024 * 1024
 const WAYLAND_PERSISTENCE_MIN_AGENT_VERSION = '0.3.151'
+const WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION = '0.3.153'
 const VIEWER_RECONNECT_GRACE_MS = 90 * 1000
 const AGENT_RESTART_GRACE_MS = 10 * 60 * 1000
 const activeViewerSessions = new Map()
@@ -52,6 +53,34 @@ function versionAtLeast(value, minimum) {
   return target.length > 0
 }
 function randomSecret(prefix) { return `${prefix}_${randomBytes(32).toString('base64url')}` }
+
+function requestAgentReply(agentDeviceId, requestType, responseType, timeoutMs = 2500) {
+  const requestId = randomUUID()
+  return new Promise((resolve) => {
+    let settled = false
+    let timer = null
+    let unsubscribe = () => {}
+
+    const finish = (payload = null) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      try { unsubscribe() } catch {}
+      resolve(payload)
+    }
+
+    unsubscribe = subscribeAgentMessages(agentDeviceId, (payload) => {
+      if (clean(payload?.type) !== responseType) return
+      if (clean(payload?.request_id) !== requestId) return
+      finish(payload)
+    })
+
+    timer = setTimeout(() => finish(null), timeoutMs)
+    if (!sendAgentMessage(agentDeviceId, { type: requestType, request_id: requestId })) {
+      finish(null)
+    }
+  })
+}
 function isPortableUserAgent(value = '') {
   return /Android|iPhone|iPad|iPod|Mobile|Tablet|Kindle|Silk/i.test(String(value || ''))
 }
@@ -366,6 +395,59 @@ export function registerRmmRemoteRoutes(app) {
     }, 201)
   })
 
+  app.get('/api/v1/rmm/devices/:agentDeviceId/wayland-persistence', async (c) => {
+    const auth = await requireRemoteAccess(c)
+    if (auth.error) return auth.error
+
+    const agent = await agentForRemoteSession(
+      auth.session.tenant_id,
+      clean(c.req.param('agentDeviceId')),
+    )
+    if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+
+    if (remoteEndpointPlatform(agent) !== 'linux') {
+      return c.json({
+        supported: false,
+        remembered: false,
+        state: 'unsupported',
+        reason: 'not_linux',
+      })
+    }
+
+    if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION)) {
+      return c.json({
+        supported: false,
+        remembered: null,
+        state: 'upgrade_required',
+        currentAgentVersion: clean(agent.agent_version) || null,
+        requiredAgentVersion: WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION,
+      })
+    }
+
+    const reply = await requestAgentReply(
+      agent.id,
+      'get_wayland_persistence_status',
+      'wayland_persistence_status',
+    )
+    if (!reply) {
+      return c.json({
+        supported: true,
+        remembered: null,
+        state: 'unknown',
+        online: false,
+      })
+    }
+
+    return c.json({
+      supported: reply.supported === true,
+      remembered: reply.remembered === true,
+      state: clean(reply.status) || (reply.remembered === true ? 'remembered' : 'not_remembered'),
+      online: true,
+      activeUser: clean(reply.user) || null,
+      checkedAt: new Date().toISOString(),
+    })
+  })
+
   app.post('/api/v1/rmm/devices/:agentDeviceId/wayland-persistence/forget', async (c) => {
     const auth = await requireRemoteAccess(c)
     if (auth.error) return auth.error
@@ -391,13 +473,18 @@ export function registerRmmRemoteRoutes(app) {
       return c.json({ error: 'The Hi5Central Agent is currently offline.' }, 409)
     }
 
-    const requestId = randomUUID()
-    if (!safeSend(liveSocket, {
-      type: 'forget_wayland_remote_access',
-      request_id: requestId,
-    })) {
-      return c.json({ error: 'Unable to send the forget request to the Agent.' }, 409)
+    const reply = await requestAgentReply(
+      agent.id,
+      'forget_wayland_remote_access',
+      'wayland_persistence_forgotten',
+    )
+    if (!reply) {
+      return c.json({ error: 'The Agent did not confirm that remembered Wayland access was cleared.' }, 504)
     }
+    if (reply.success !== true) {
+      return c.json({ error: clean(reply.error) || 'Unable to clear remembered Wayland access.' }, 409)
+    }
+    const requestId = clean(reply.request_id) || null
 
     const actorLabel = clean(auth.session.name || auth.session.email) || 'Technician'
     recordRmmActivity({
@@ -423,9 +510,12 @@ export function registerRmmRemoteRoutes(app) {
     return c.json({
       success: true,
       requestId,
+      remembered: false,
+      state: 'not_remembered',
+      activeUser: clean(reply.user) || null,
       limited: true,
       message: 'Remembered Wayland access was cleared for the active Linux user.',
-    }, 202)
+    })
   })
 
   app.get('/api/v1/rmm/remote-sessions', async (c) => {
