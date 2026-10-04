@@ -467,11 +467,11 @@ async function ingestInventory(agent, payload) {
     await client.query(
       `UPDATE rmm_agent_devices SET
          agent_version=COALESCE(NULLIF($2,''),agent_version),
-         last_inventory_at=$3::timestamptz,
+         last_inventory_at=now(),
          last_authenticated_at=now(),
          updated_at=now()
        WHERE id=$1`,
-      [agent.id, clean(agentInfo.version), collectedAt],
+      [agent.id, clean(agentInfo.version)],
     )
 
     await ingestWindowsUpdateInventory(agent, effectivePayload, client)
