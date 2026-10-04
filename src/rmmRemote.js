@@ -20,6 +20,7 @@ const TURN_SHARED_SECRET_FILE = process.env.TURN_SHARED_SECRET_FILE || '/run/sec
 const SESSION_TTL_SECONDS = 15 * 60
 const ACTIVE_RECONNECT_TTL_SECONDS = 8 * 60 * 60
 const MAX_VIEWER_PAYLOAD_BYTES = 8 * 1024 * 1024
+const WAYLAND_PERSISTENCE_MIN_AGENT_VERSION = '0.3.151'
 const VIEWER_RECONNECT_GRACE_MS = 90 * 1000
 const AGENT_RESTART_GRACE_MS = 10 * 60 * 1000
 const activeViewerSessions = new Map()
@@ -39,6 +40,17 @@ const VIEWER_MESSAGE_TYPES = new Set([
 
 function clean(value = '') { return String(value ?? '').trim() }
 function sha256(value = '') { return createHash('sha256').update(String(value)).digest('hex') }
+function versionAtLeast(value, minimum) {
+  const current = clean(value).match(/\d+(?:\.\d+){1,3}/)?.[0]?.split('.').map(Number) || []
+  const target = clean(minimum).match(/\d+(?:\.\d+){1,3}/)?.[0]?.split('.').map(Number) || []
+  const length = Math.max(current.length, target.length)
+  for (let index = 0; index < length; index += 1) {
+    const left = current[index] || 0
+    const right = target[index] || 0
+    if (left !== right) return left > right
+  }
+  return target.length > 0
+}
 function randomSecret(prefix) { return `${prefix}_${randomBytes(32).toString('base64url')}` }
 function isPortableUserAgent(value = '') {
   return /Android|iPhone|iPad|iPod|Mobile|Tablet|Kindle|Silk/i.test(String(value || ''))
@@ -290,10 +302,22 @@ export function registerRmmRemoteRoutes(app) {
     })
 
     const endpointPlatform = remoteEndpointPlatform(agent)
-    const waylandPersistence =
+    const waylandPersistenceRequested =
       mode === 'console' &&
       endpointPlatform === 'linux' &&
       body.waylandPersistence === true
+    const waylandPersistenceSupported =
+      endpointPlatform === 'linux' &&
+      versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)
+
+    if (waylandPersistenceRequested && !waylandPersistenceSupported) {
+      return c.json({
+        error: 'Persistent Wayland access requires Hi5Central Agent ' + WAYLAND_PERSISTENCE_MIN_AGENT_VERSION + ' or newer.',
+        requiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
+        currentAgentVersion: clean(agent.agent_version) || null,
+      }, 409)
+    }
+    const waylandPersistence = waylandPersistenceRequested && waylandPersistenceSupported
 
     const viewerClient = viewerClientForRequest(c, body.viewerClient)
     const viewerPlatform = viewerClient === 'native' ? viewerPlatformForRequest(c, body.viewerPlatform) : 'browser'
@@ -329,6 +353,8 @@ export function registerRmmRemoteRoutes(app) {
         reference: agent.reference,
         endpointPlatform,
         waylandPersistence,
+        waylandPersistenceSupported,
+        waylandPersistenceRequiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
       },
       connection,
       viewerClient,
@@ -351,6 +377,13 @@ export function registerRmmRemoteRoutes(app) {
     if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
     if (remoteEndpointPlatform(agent) !== 'linux') {
       return c.json({ error: 'Remembered Wayland access is only available for Linux endpoints.' }, 409)
+    }
+    if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)) {
+      return c.json({
+        error: 'Forgetting remembered Wayland access requires Hi5Central Agent ' + WAYLAND_PERSISTENCE_MIN_AGENT_VERSION + ' or newer.',
+        requiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
+        currentAgentVersion: clean(agent.agent_version) || null,
+      }, 409)
     }
 
     const liveSocket = agentSocketForDevice(agent.id)
