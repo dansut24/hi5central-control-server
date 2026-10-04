@@ -1691,6 +1691,8 @@ async function patchBundle(tenantId) {
       inventoryId: device.inventory_id,
       agentDeviceId: device.agent_device_id,
       name: device.name,
+      operatingSystem: device.operating_system || '',
+      osUpdates: object(object(device.source_payload).os_updates),
       online: device.online,
       siteId: device.site_id || '',
       site: device.site_name || '',
