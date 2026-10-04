@@ -207,10 +207,27 @@ function remoteEndpointPlatform(agent = {}) {
   return 'unknown'
 }
 
+function remoteDesktopInventory(agent = {}) {
+  const inventory = object(agent.source_payload)
+  const direct = object(inventory.remote_desktop)
+  if (Object.keys(direct).length) return direct
+  return object(object(object(inventory.agent).capabilities).remote_desktop_capabilities)
+}
+
+function endpointUsesWayland(agent = {}) {
+  if (remoteEndpointPlatform(agent) !== 'linux') return false
+  const remote = remoteDesktopInventory(agent)
+  const backend = clean(remote.backend).toLowerCase()
+  const sessionType = clean(remote.session_type).toLowerCase()
+  return backend.includes('wayland')
+    || sessionType.includes('wayland')
+    || object(remote.wayland).detected === true
+}
+
 async function agentForRemoteSession(tenantId, agentDeviceId) {
   const result = await pool.query(
     `SELECT a.id,a.tenant_id,a.inventory_id,a.websocket_status,a.last_telemetry_at,a.agent_version,
-            i.reference,i.name,i.serial_number,i.platform,i.operating_system
+            i.reference,i.name,i.serial_number,i.platform,i.operating_system,i.source_payload
        FROM rmm_agent_devices a
        JOIN rmm_device_inventory i ON i.id=a.inventory_id
       WHERE a.id::text=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true
@@ -335,10 +352,17 @@ export function registerRmmRemoteRoutes(app) {
       mode === 'console' &&
       endpointPlatform === 'linux' &&
       body.waylandPersistence === true
+    const waylandEndpoint = endpointUsesWayland(agent)
     const waylandPersistenceSupported =
-      endpointPlatform === 'linux' &&
+      waylandEndpoint &&
       versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)
 
+    if (waylandPersistenceRequested && !waylandEndpoint) {
+      return c.json({
+        error: 'Persistent Wayland access is only available while the endpoint is using a Wayland desktop session.',
+        reason: 'not_wayland_session',
+      }, 409)
+    }
     if (waylandPersistenceRequested && !waylandPersistenceSupported) {
       return c.json({
         error: 'Persistent Wayland access requires Hi5Central Agent ' + WAYLAND_PERSISTENCE_MIN_AGENT_VERSION + ' or newer.',
@@ -413,6 +437,14 @@ export function registerRmmRemoteRoutes(app) {
         reason: 'not_linux',
       })
     }
+    if (!endpointUsesWayland(agent)) {
+      return c.json({
+        supported: false,
+        remembered: false,
+        state: 'unsupported',
+        reason: 'not_wayland_session',
+      })
+    }
 
     if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION)) {
       return c.json({
@@ -459,6 +491,9 @@ export function registerRmmRemoteRoutes(app) {
     if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
     if (remoteEndpointPlatform(agent) !== 'linux') {
       return c.json({ error: 'Remembered Wayland access is only available for Linux endpoints.' }, 409)
+    }
+    if (!endpointUsesWayland(agent)) {
+      return c.json({ error: 'Remembered Wayland access is only available while the endpoint is using a Wayland desktop session.' }, 409)
     }
     if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)) {
       return c.json({
