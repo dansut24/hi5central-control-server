@@ -571,8 +571,13 @@ export function attachRmmViewerWebSocket(server) {
       nextAgentWs.on('message', relayFromAgent)
       if (restarted) safeSend(active.viewerWs, { type: 'agent_reconnected', session_id: sessionId })
       const sent = safeSend(nextAgentWs, {
-        type: 'start_webrtc', session_id: sessionId, mode: remote.mode,
-        technician_name: active.technicianName, iceServers: active.iceAgent,
+        type: 'start_webrtc',
+        session_id: sessionId,
+        mode: remote.mode,
+        session_type: 'unattended',
+        technician_name: active.technicianName,
+        chat_available: remote.mode === 'console',
+        iceServers: active.iceAgent,
       })
       if (sent) safeSend(active.viewerWs, { type: 'start_webrtc_sent', session_id: sessionId, restarted })
       return sent
