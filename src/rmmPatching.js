@@ -3094,7 +3094,7 @@ export async function evaluateRealtimeVulnerabilityPolicies(tenantId, { dispatch
        FROM rmm_vulnerability_exposures e JOIN rmm_vulnerabilities v ON v.cve_id=e.cve_id
        LEFT JOIN rmm_agent_devices a ON a.inventory_id=e.inventory_id AND a.tenant_id=e.tenant_id AND a.disabled_at IS NULL
        LEFT JOIN rmm_software_catalogue c ON c.id=e.catalogue_id
-      WHERE e.tenant_id=$1 AND e.status='open'`, [tenantId])
+      WHERE e.tenant_id=$1 AND e.status='open' AND e.remediation_domain='software'`, [tenantId])
   const decisions=[]
   for (const exposure of exposures.rows) {
     const policy=await effectiveVulnerabilityPolicy(tenantId, exposure)
@@ -4544,7 +4544,7 @@ export function registerRmmPatchingRoutes(app) {
   })
 
   app.post('/api/v1/rmm/vulnerability-exposures/:exposureId/remediate', async (c) => {
-    const auth = await requirePatchAccess(c, 'software')
+    const auth = await requirePatchAccess(c)
     if (auth.error) return auth.error
     if (!hasPermission(auth.session.access, 'rmm.devices.control')) {
       return c.json({ error: 'You do not have permission to control RMM devices.' }, 403)
@@ -4552,11 +4552,16 @@ export function registerRmmPatchingRoutes(app) {
 
     const exposureId = clean(c.req.param('exposureId'))
     const exposureResult = await pool.query(
-      `SELECT e.id::text,e.cve_id,e.status,e.remediation_state,e.catalogue_id,
-              a.agent_device_id
+      `SELECT e.id::text,e.cve_id,e.status,e.remediation_state,e.catalogue_id,e.inventory_id,
+              e.application_name,e.remediation_domain,e.remediation_provider,e.remediation_target_version,
+              e.exposure_class,e.platform,e.package_manager,e.package_name,e.evidence,
+              i.name AS device_name,i.reference AS device_reference,
+              a.agent_device_id,a.device_online
          FROM rmm_vulnerability_exposures e
+         JOIN rmm_device_inventory i ON i.id=e.inventory_id
          LEFT JOIN LATERAL (
-           SELECT id::text AS agent_device_id
+           SELECT id::text AS agent_device_id,
+                  (websocket_status='Connected' AND last_telemetry_at>now()-interval '90 seconds') AS device_online
              FROM rmm_agent_devices
             WHERE tenant_id=e.tenant_id AND inventory_id=e.inventory_id AND disabled_at IS NULL
             ORDER BY last_telemetry_at DESC NULLS LAST
@@ -4571,11 +4576,119 @@ export function registerRmmPatchingRoutes(app) {
     if (exposure.status !== 'open') {
       return c.json({ error: 'This vulnerability exposure is no longer open.' }, 409)
     }
-    if (exposure.remediation_state !== 'available' || !exposure.catalogue_id) {
-      return c.json({ error: 'No verified software remediation is currently available for this exposure.' }, 409)
+    if (exposure.remediation_state !== 'available') {
+      return c.json({ error: 'No verified remediation is currently available for this exposure.' }, 409)
     }
-    if (!exposure.agent_device_id) {
+    if (!exposure.agent_device_id || exposure.device_online !== true) {
       return c.json({ error: 'This device is offline. No patch job was queued.', offline: true }, 409)
+    }
+
+    if (clean(exposure.remediation_domain) === 'os') {
+      const remediation = object(object(exposure.evidence).remediation)
+      const updateId = clean(remediation.updateId)
+      if (!updateId) {
+        return c.json({ error: 'The native OS update that remediates this exposure is no longer available. Run an OS update scan and retry.' }, 409)
+      }
+
+      const inserted = await pool.query(
+        `INSERT INTO rmm_agent_jobs
+          (tenant_id,agent_device_id,job_type,payload,initiated_by,initiated_by_label,correlation_id,request_metadata)
+         VALUES ($1,$2,'os.update.install',$3::jsonb,'technician',$4,gen_random_uuid(),$5::jsonb)
+         RETURNING id,job_type,status,created_at`,
+        [
+          auth.session.tenant_id,
+          exposure.agent_device_id,
+          JSON.stringify({ update_ids: [updateId], allow_feature_upgrade: false }),
+          clean(auth.session.name || auth.session.email || 'Technician'),
+          JSON.stringify({
+            source: 'rmm_vulnerability_remediation',
+            cve_id: exposure.cve_id,
+            exposure_id: exposure.id,
+            remediation_domain: 'os',
+            exposure_class: clean(exposure.exposure_class),
+            platform: clean(exposure.platform),
+            package_manager: clean(exposure.package_manager),
+            package_name: clean(exposure.package_name),
+            target_version: clean(exposure.remediation_target_version),
+          }),
+        ],
+      )
+      const job = inserted.rows[0]
+      const claimed = await pool.query(
+        `UPDATE rmm_agent_jobs
+            SET status='claimed',claimed_at=now(),updated_at=now()
+          WHERE id=$1 AND tenant_id=$2 AND status='queued'
+          RETURNING status,claimed_at,updated_at`,
+        [job.id, auth.session.tenant_id],
+      )
+      if (!claimed.rowCount) {
+        return c.json({ error: 'Unable to claim the native OS remediation job.' }, 409)
+      }
+      Object.assign(job, claimed.rows[0])
+
+      const pushed = sendAgentMessage(exposure.agent_device_id, {
+        type: 'job_execute',
+        job: {
+          id: job.id,
+          job_type: 'os.update.install',
+          payload: { update_ids: [updateId], allow_feature_upgrade: false },
+          created_at: job.created_at,
+        },
+      })
+      if (!pushed) {
+        await pool.query(
+          `UPDATE rmm_agent_jobs
+              SET status='cancelled',claimed_at=NULL,completed_at=now(),
+                  error_message='Device went offline before native OS vulnerability remediation could be dispatched.',
+                  updated_at=now()
+            WHERE id=$1 AND tenant_id=$2`,
+          [job.id, auth.session.tenant_id],
+        )
+        return c.json({ error: 'The device went offline before remediation could be dispatched. No patch job was retained.', offline: true }, 409)
+      }
+
+      await pool.query(
+        `UPDATE rmm_vulnerability_exposures
+            SET remediation_state='in_progress',last_seen_at=now()
+          WHERE tenant_id=$1 AND id=$2`,
+        [auth.session.tenant_id, exposure.id],
+      )
+      await recordRmmActivity({
+        tenantId: auth.session.tenant_id,
+        agentDeviceId: exposure.agent_device_id,
+        inventoryId: exposure.inventory_id,
+        actorUserId: auth.session.user_id,
+        actorType: 'technician',
+        actorLabel: clean(auth.session.name || auth.session.email || 'Technician'),
+        eventType: 'vulnerability.os_remediation_requested',
+        category: 'patching',
+        summary: 'Requested native OS remediation for ' + exposure.cve_id,
+        detail: clean(exposure.application_name) + (exposure.remediation_target_version ? ' → ' + exposure.remediation_target_version : ''),
+        outcome: 'requested',
+        severity: 'info',
+        jobId: job.id,
+        metadata: {
+          cveId: exposure.cve_id,
+          exposureId: exposure.id,
+          exposureClass: exposure.exposure_class,
+          remediationDomain: 'os',
+          provider: exposure.remediation_provider,
+          updateId,
+        },
+      }).catch(() => {})
+
+      return c.json({
+        success: true,
+        cveId: exposure.cve_id,
+        job,
+        provider: exposure.remediation_provider,
+        remediationDomain: 'os',
+        bundle: await patchBundle(auth.session.tenant_id),
+      }, 202)
+    }
+
+    if (!exposure.catalogue_id) {
+      return c.json({ error: 'No verified software remediation is currently available for this exposure.' }, 409)
     }
 
     const plan = await softwarePatchPlan(
@@ -4611,6 +4724,7 @@ export function registerRmmPatchingRoutes(app) {
       job: dispatched.job,
       deployment: dispatched.deployment,
       provider: plan.provider,
+      remediationDomain: 'software',
       bundle: await patchBundle(auth.session.tenant_id),
     }, 202)
   })
