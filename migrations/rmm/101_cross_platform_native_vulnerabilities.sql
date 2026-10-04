@@ -29,6 +29,20 @@ ALTER TABLE rmm_vulnerability_exposures
 CREATE INDEX IF NOT EXISTS rmm_vulnerability_exposures_domain_idx
   ON rmm_vulnerability_exposures(tenant_id,remediation_domain,exposure_class,status,last_seen_at DESC);
 
+CREATE TABLE IF NOT EXISTS rmm_native_package_vulnerability_cache (
+  ecosystem text NOT NULL,
+  package_name text NOT NULL,
+  version text NOT NULL,
+  cve_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  checked_at timestamptz NOT NULL DEFAULT now(),
+  last_error text NOT NULL DEFAULT '',
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (ecosystem,package_name,version)
+);
+
+CREATE INDEX IF NOT EXISTS rmm_native_package_vulnerability_cache_checked_idx
+  ON rmm_native_package_vulnerability_cache(checked_at);
+
 INSERT INTO rmm_vulnerability_sync_state (source,enabled,metadata)
 VALUES (
   'apple_security',
