@@ -933,12 +933,28 @@ async function ingestInventory(agent, payload) {
 
 async function packageRows(tenantId) {
   const result = await pool.query(
-    `SELECT id,label,token_hint,expires_at,max_uses,use_count,last_used_at,revoked_at,created_at,
-            persistent,artifact_build_requested_at,artifact_build_completed_at,artifact_build_error
-       FROM rmm_agent_enrollment_packages
-      WHERE tenant_id=$1
-        AND parent_deployment_id IS NULL
-      ORDER BY created_at DESC
+    `SELECT p.id,p.label,p.token_hint,p.expires_at,p.max_uses,
+            CASE WHEN p.persistent
+              THEN p.use_count + COALESCE(children.child_use_count,0)
+              ELSE p.use_count
+            END AS use_count,
+            COALESCE(
+              GREATEST(p.last_used_at,children.child_last_used_at),
+              p.last_used_at,
+              children.child_last_used_at
+            ) AS last_used_at,
+            p.revoked_at,p.created_at,p.persistent,
+            p.artifact_build_requested_at,p.artifact_build_completed_at,p.artifact_build_error
+       FROM rmm_agent_enrollment_packages p
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM(child.use_count),0)::integer AS child_use_count,
+                MAX(child.last_used_at) AS child_last_used_at
+           FROM rmm_agent_enrollment_packages child
+          WHERE child.parent_deployment_id=p.id
+       ) children ON true
+      WHERE p.tenant_id=$1
+        AND p.parent_deployment_id IS NULL
+      ORDER BY p.created_at DESC
       LIMIT 25`,
     [tenantId],
   )
