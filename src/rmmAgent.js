@@ -30,7 +30,7 @@ const TENANT_INSTALLER_API_BASE = process.env.TENANT_INSTALLER_API_BASE || 'http
 const TENANT_INSTALLER_ARTIFACT_DIR = process.env.TENANT_INSTALLER_ARTIFACT_DIR || '/srv/tenant-installers'
 const TENANT_INSTALLER_MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
 const TENANT_INSTALLER_GENERIC_URLS = {
-  exe: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.exe',
+  exe: 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe',
   msi: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.msi',
   app: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.app.zip',
   pkg: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.pkg',
@@ -897,8 +897,7 @@ async function ingestInventory(agent, payload) {
       [agent.inventory_id],
     )
     const previousPayload = previousResult.rows[0]?.source_payload && typeof previousResult.rows[0].source_payload === 'object'
-      ? previousResult.rows[0].source_payload      : {}
-    const effectivePayload = mergeRetainedDeepInventory(previousPayload, payload)
+      ? previousResult.rows[0].source_payload      : {}    const effectivePayload = mergeRetainedDeepInventory(previousPayload, payload)
 
     await client.query(
       `UPDATE rmm_device_inventory SET
@@ -1047,7 +1046,7 @@ export function registerRmmAgentRoutes(app) {
       ? pkg.installer_format === 'msi'
         ? 'msiexec /i "Hi5CentralAgentDeployment-Windows.msi" /qn HI5DEPLOYMENTCONFIG="%CD%\\Hi5CentralDeployment.json"'
         : pkg.installer_format === 'exe'
-          ? '.\\Hi5CentralAgentDeployment-Windows.exe --quiet --config ".\\Hi5CentralDeployment.json"'
+          ? '.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DEPLOYMENT_CONFIG=".\\Hi5CentralDeployment.json" /INSTALL_SOURCE="deployment-json"'
           : pkg.installer_format === 'run'
             ? 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
             : pkg.installer_format === 'deb'
@@ -1797,8 +1796,7 @@ export function registerRmmAgentRoutes(app) {
     const body = await c.req.json().catch(() => ({}))
     if (!body || typeof body !== 'object') return c.json({ success: false, error: 'Inventory payload is required.' }, 400)
     if (clean(body.device_id) && clean(body.device_id) !== String(agent.id)) {      return c.json({ success: false, error: 'Inventory device identity does not match authentication.' }, 409)
-    }
-    await ingestInventory(agent, body)
+    }    await ingestInventory(agent, body)
     return c.json({ success: true })
   })
 
