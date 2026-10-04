@@ -2983,6 +2983,16 @@ function patchPolicyResolutionItem(row, type) {
       assignment,
       settings: {
         automaticInstall: rules.autoInstall === true,
+        platforms: Object.keys(object(rules.platforms)).length
+          ? {
+              windows: object(rules.platforms).windows === true,
+              linux: object(rules.platforms).linux === true,
+              macos: object(rules.platforms).macos === true,
+            }
+          : { windows: true, linux: false, macos: false },
+        unixInstallMode: ['all', 'security_only'].includes(clean(object(rules.unix).installMode))
+          ? clean(object(rules.unix).installMode)
+          : 'all',
         maintenanceWindow: object(row.maintenance_window),
         rolloutEnabled: rollout.enabled === true,
         deadlineDays: Number(rollout.deadlineDays ?? 0),
@@ -3238,7 +3248,22 @@ function normalizeWindowsRules(value = {}, deploymentDelayDays = 0) {
     const configured = Number(delays[key])
     return Math.max(0, Math.min(365, Number.isFinite(configured) ? configured : fallback))
   }
+  const platformSource = object(source.platforms)
+  const platformsConfigured = Object.keys(platformSource).length > 0
+  const unixSource = object(source.unix)
+  const unixInstallMode = ['all', 'security_only'].includes(clean(unixSource.installMode))
+    ? clean(unixSource.installMode)
+    : 'all'
   return {
+    platforms: {
+      windows: platformsConfigured ? platformSource.windows === true : true,
+      linux: platformsConfigured ? platformSource.linux === true : false,
+      macos: platformsConfigured ? platformSource.macos === true : false,
+    },
+    unix: {
+      installMode: unixInstallMode,
+      includeMajorMacOsUpgrades: false,
+    },
     autoInstall: source.autoInstall === true,
     includeDrivers: source.includeDrivers === true,
     includeFeatureUpdates: source.includeFeatureUpdates === true,
@@ -3497,6 +3522,255 @@ function agentVersionAtLeast(current = '', required = '') {
   return left.length > 0 && right.length > 0
 }
 
+function osPlatformFamily(value = '') {
+  const platform = lower(value)
+  if (platform.includes('windows')) return 'windows'
+  if (platform.includes('mac') || platform.includes('darwin')) return 'macos'
+  if (platform.includes('linux') || platform.includes('fedora') || platform.includes('ubuntu') || platform.includes('debian')) return 'linux'
+  return 'other'
+}
+
+function osPolicyPlatforms(policy) {
+  const configured = object(object(policy?.windows_rules).platforms)
+  if (!Object.keys(configured).length) return { windows: true, linux: false, macos: false }
+  return {
+    windows: configured.windows === true,
+    linux: configured.linux === true,
+    macos: configured.macos === true,
+  }
+}
+
+function unixOsPolicySettings(policy) {
+  const unix = object(object(policy?.windows_rules).unix)
+  return {
+    installMode: ['all', 'security_only'].includes(clean(unix.installMode)) ? clean(unix.installMode) : 'all',
+    includeMajorMacOsUpgrades: false,
+  }
+}
+
+function osPolicyMinimumAgentVersion(family) {
+  if (family === 'linux') return '0.3.155'
+  if (family === 'macos') return '0.3.103'
+  if (family === 'windows') return '0.1.214'
+  return ''
+}
+
+async function recentScheduledUnixOsJob(tenantId, agentDeviceId, policyId) {
+  const result = await pool.query(
+    `SELECT id,job_type,status,created_at
+       FROM rmm_agent_jobs
+      WHERE tenant_id=$1 AND agent_device_id=$2
+        AND job_type IN ('os.update.scan','os.update.install')
+        AND request_metadata->>'source'='os_patch_schedule'
+        AND request_metadata->>'policy_id'=$3
+        AND created_at > now() - interval '5 minutes'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [tenantId, agentDeviceId, policyId],
+  )
+  return result.rows[0] || null
+}
+
+async function dispatchScheduledUnixOsAction(tenantId, device, policy, jobType, payload) {
+  const label = 'SYSTEM · OS patch schedule'
+  const inserted = await pool.query(
+    `INSERT INTO rmm_agent_jobs
+      (tenant_id,agent_device_id,job_type,payload,initiated_by,initiated_by_label,request_metadata)
+     VALUES ($1,$2,$3,$4::jsonb,'system',$5,$6::jsonb)
+     RETURNING id,job_type,status,created_at`,
+    [
+      tenantId,
+      device.agent_device_id,
+      jobType,
+      JSON.stringify(payload || {}),
+      label,
+      JSON.stringify({
+        source: 'os_patch_schedule',
+        policy_id: clean(policy.id),
+        policy_name: clean(policy.name),
+        platform: osPlatformFamily(device.operating_system),
+        device_name: clean(device.name),
+        device_reference: clean(device.reference),
+      }),
+    ],
+  )
+  const job = inserted.rows[0]
+  const claimed = await pool.query(
+    `UPDATE rmm_agent_jobs
+        SET status='claimed',claimed_at=now(),updated_at=now()
+      WHERE id=$1 AND tenant_id=$2 AND status='queued'
+      RETURNING status,claimed_at,updated_at`,
+    [job.id, tenantId],
+  )
+  if (!claimed.rowCount) return { dispatched: false, jobId: clean(job.id), reason: 'claim_failed' }
+  Object.assign(job, claimed.rows[0])
+
+  const pushed = sendAgentMessage(device.agent_device_id, {
+    type: 'job_execute',
+    job: { id: job.id, job_type: jobType, payload: payload || {}, created_at: job.created_at },
+  })
+  if (!pushed) {
+    await pool.query(
+      `UPDATE rmm_agent_jobs
+          SET status='cancelled',claimed_at=NULL,completed_at=now(),
+              error_message='Device went offline before the scheduled OS patch action could be dispatched.',
+              updated_at=now()
+        WHERE id=$1 AND tenant_id=$2`,
+      [job.id, tenantId],
+    )
+    return { dispatched: false, jobId: clean(job.id), reason: 'offline_before_dispatch' }
+  }
+
+  await recordRmmActivity({
+    tenantId,
+    agentDeviceId: device.agent_device_id,
+    inventoryId: device.inventory_id,
+    actorUserId: null,
+    actorType: 'system',
+    actorLabel: label,
+    eventType: jobType === 'os.update.scan' ? 'os_update.scan_scheduled' : 'os_update.install_scheduled',
+    category: 'patching',
+    summary: label + (jobType === 'os.update.scan' ? ' requested an OS update scan' : ' dispatched OS updates'),
+    detail: clean(policy.name),
+    outcome: 'requested',
+    severity: 'info',
+    jobId: job.id,
+    metadata: {
+      policyId: clean(policy.id),
+      platform: osPlatformFamily(device.operating_system),
+      installMode: payload?.security_only === true ? 'security_only' : 'all',
+    },
+  }).catch(() => {})
+
+  return { dispatched: true, jobId: clean(job.id) }
+}
+
+export async function evaluateUnixOsPatchPolicies(tenantId, { dispatch = true, at = new Date() } = {}) {
+  const devices = await pool.query(
+    `SELECT i.id AS inventory_id,i.reference,i.name,i.operating_system,i.source_payload,
+            a.id AS agent_device_id,a.agent_version,a.websocket_status,a.last_telemetry_at
+       FROM rmm_device_inventory i
+       JOIN LATERAL (
+         SELECT ad.id,ad.agent_version,ad.websocket_status,ad.last_telemetry_at,ad.last_authenticated_at
+           FROM rmm_agent_devices ad
+          WHERE ad.tenant_id=i.tenant_id AND ad.inventory_id=i.id AND ad.disabled_at IS NULL
+          ORDER BY ad.last_authenticated_at DESC NULLS LAST
+          LIMIT 1
+       ) a ON true
+      WHERE i.tenant_id=$1 AND i.active=true
+        AND (lower(i.operating_system) LIKE '%linux%'
+             OR lower(i.operating_system) LIKE '%mac%'
+             OR lower(i.operating_system) LIKE '%darwin%')`,
+    [tenantId],
+  )
+
+  const decisions = []
+  for (const device of devices.rows) {
+    const family = osPlatformFamily(device.operating_system)
+    const matches = await patchPolicyMatchesForDevice(tenantId, device.inventory_id, 'os')
+    const policy = matches[0] || null
+    if (!policy) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, action: 'skip', reason: 'no_os_patch_policy' })
+      continue
+    }
+
+    const platforms = osPolicyPlatforms(policy)
+    if (platforms[family] !== true) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'skip', reason: 'platform_not_enabled' })
+      continue
+    }
+
+    const requiredVersion = osPolicyMinimumAgentVersion(family)
+    if (!agentVersionAtLeast(device.agent_version, requiredVersion)) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'skip', reason: 'agent_upgrade_required', requiredAgentVersion: requiredVersion })
+      continue
+    }
+
+    const online =
+      clean(device.websocket_status).toLowerCase() === 'connected' &&
+      device.last_telemetry_at &&
+      Date.now() - new Date(device.last_telemetry_at).getTime() <= 90_000
+    const rules = object(policy.windows_rules)
+    const maintenance = windowsMaintenanceWindow({ maintenance_window: object(policy.maintenance_window) }, at)
+    if (rules.autoInstall !== true) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'observe', reason: 'automatic_install_disabled', online, maintenanceOpen: Boolean(maintenance.open) })
+      continue
+    }
+    if (!maintenance.open) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'wait', reason: 'outside_maintenance_window', online, maintenanceOpen: false })
+      continue
+    }
+    if (!online) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'wait', reason: 'device_offline', online: false, maintenanceOpen: true })
+      continue
+    }
+
+    const recent = await recentScheduledUnixOsJob(tenantId, device.agent_device_id, clean(policy.id))
+    if (recent) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'wait', reason: 'recent_schedule_job', jobId: clean(recent.id), online: true, maintenanceOpen: true })
+      continue
+    }
+
+    const inventory = object(object(device.source_payload).os_updates)
+    const lastScan = Date.parse(clean(inventory.last_scan_utc))
+    const scanStale =
+      clean(inventory.status) === 'not_scanned' ||
+      !Number.isFinite(lastScan) ||
+      Date.now() - lastScan > 6 * 60 * 60 * 1000
+
+    if (scanStale) {
+      const pushed = dispatch ? await dispatchScheduledUnixOsAction(tenantId, device, policy, 'os.update.scan', {}) : { dispatched: false, jobId: '' }
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'scan', reason: 'inventory_stale', jobId: pushed.jobId || '', dispatched: pushed.dispatched === true, online: true, maintenanceOpen: true })
+      continue
+    }
+
+    const settings = unixOsPolicySettings(policy)
+    const updates = array(inventory.updates)
+    const eligible = updates.filter((item) =>
+      item?.actionable !== false &&
+      item?.feature_upgrade !== true &&
+      (settings.installMode !== 'security_only' || item?.security === true || item?.is_security === true)
+    )
+    if (!eligible.length) {
+      decisions.push({ inventoryId: device.inventory_id, deviceName: device.name, platform: family, policyId: policy.id, policyName: policy.name, action: 'none', reason: 'no_eligible_updates', pendingCount: Number(inventory.pending_count || 0), online: true, maintenanceOpen: true })
+      continue
+    }
+
+    const payload = {
+      all: true,
+      security_only: settings.installMode === 'security_only',
+      allow_feature_upgrade: false,
+    }
+    const pushed = dispatch ? await dispatchScheduledUnixOsAction(tenantId, device, policy, 'os.update.install', payload) : { dispatched: false, jobId: '' }
+    decisions.push({
+      inventoryId: device.inventory_id,
+      deviceName: device.name,
+      platform: family,
+      policyId: policy.id,
+      policyName: policy.name,
+      action: 'install',
+      eligibleCount: eligible.length,
+      installMode: settings.installMode,
+      jobId: pushed.jobId || '',
+      dispatched: pushed.dispatched === true,
+      online: true,
+      maintenanceOpen: true,
+    })
+  }
+  return decisions
+}
+
+let unixPatchTimer = null
+async function runUnixPatchSchedules() {
+  const tenants = await pool.query(
+    'SELECT DISTINCT tenant_id FROM rmm_agent_devices WHERE disabled_at IS NULL AND tenant_id IS NOT NULL',
+  )
+  for (const row of tenants.rows) {
+    await evaluateUnixOsPatchPolicies(row.tenant_id, { dispatch: true })
+      .catch((error) => console.error('RMM Unix OS patch schedule evaluation failed', row.tenant_id, error.message))
+  }
+}
+
 async function patchAssignmentScopeDevices(tenantId, scopeType, scopeId) {
   const result = await pool.query(
     `SELECT i.id AS inventory_id,i.reference,i.name,i.operating_system,
@@ -3570,7 +3844,7 @@ export async function patchAssignmentImpactPreview(tenantId, options = {}) {
   if (!scopeId) return { error: 'Patch scope target is required.', status: 400 }
 
   const policyResult = await pool.query(
-    `SELECT id,name,software_enabled,windows_enabled,status
+    `SELECT id,name,software_enabled,windows_enabled,windows_rules,status
        FROM rmm_patch_policies
       WHERE tenant_id=$1 AND id=$2 AND status='active'
       LIMIT 1`,
@@ -3611,18 +3885,25 @@ export async function patchAssignmentImpactPreview(tenantId, options = {}) {
       || (candidatePriority === currentPriority && candidateCreatedAt >= currentCreatedAt)
 
     const hasAgent = Boolean(device.agent_device_id)
-    const isWindows = clean(device.operating_system).toLowerCase().includes('windows')
+    const family = osPlatformFamily(device.operating_system)
+    const platforms = policyType === 'os' ? osPolicyPlatforms(policy) : {}
+    const requiredAgentVersion = policyType === 'os' ? osPolicyMinimumAgentVersion(family) : ''
     let applicable = hasAgent
     let notApplicableReason = ''
     if (!hasAgent) {
       applicable = false
       notApplicableReason = 'No active Hi5Central Agent'
-    } else if (policyType === 'os' && !isWindows) {
+    } else if (policyType === 'os' && !['windows', 'linux', 'macos'].includes(family)) {
       applicable = false
-      notApplicableReason = 'OS patching applies to Windows endpoints'
-    } else if (policyType === 'os' && !agentVersionAtLeast(device.agent_version, '0.1.214')) {
+      notApplicableReason = 'OS patching supports Windows, Linux and macOS endpoints'
+    } else if (policyType === 'os' && platforms[family] !== true) {
       applicable = false
-      notApplicableReason = 'Agent 0.1.214 or later is required'
+      const platformLabel = family === 'macos' ? 'macOS' : family === 'linux' ? 'Linux' : 'Windows'
+      notApplicableReason = platformLabel + ' is not enabled in this OS patch policy'
+    } else if (policyType === 'os' && !agentVersionAtLeast(device.agent_version, requiredAgentVersion)) {
+      applicable = false
+      const platformLabel = family === 'macos' ? 'macOS' : family === 'linux' ? 'Linux' : 'Windows'
+      notApplicableReason = 'Agent ' + requiredAgentVersion + ' or later is required for ' + platformLabel
     }
 
     const online = hasAgent && clean(device.websocket_status).toLowerCase() === 'connected'
@@ -3908,6 +4189,11 @@ export function registerRmmPatchingRoutes(app) {
     windowsPatchTimer = setInterval(() => void runWindowsPatchSchedules(), 60_000)
     windowsPatchTimer.unref?.()
     setTimeout(() => void runWindowsPatchSchedules(), 20_000).unref?.()
+  }
+  if (!unixPatchTimer) {
+    unixPatchTimer = setInterval(() => void runUnixPatchSchedules(), 60_000)
+    unixPatchTimer.unref?.()
+    setTimeout(() => void runUnixPatchSchedules(), 30_000).unref?.()
   }
   app.post('/api/v1/agent/devices/patch-discovery', async (c) => {
     const agent = await authenticateAgent(c.req.header('x-hi5-device-id'), c.req.header('x-hi5-agent-secret'))
@@ -5099,6 +5385,26 @@ export function registerRmmPatchingRoutes(app) {
     return c.json({ success: true, decisions })
   })
 
+  app.post('/api/v1/rmm/os-updates/evaluate', async (c) => {
+    const auth = await requirePatchAccess(c, 'policy')
+    if (auth.error) return auth.error
+    const body = await c.req.json().catch(() => ({}))
+    const dispatch = body.dispatch !== false
+    const [windows, unix] = await Promise.all([
+      evaluateWindowsUpdatePolicies(auth.session.tenant_id, {
+        dispatch,
+        agentSocketForDevice,
+        sendAgentMessage,
+      }),
+      evaluateUnixOsPatchPolicies(auth.session.tenant_id, { dispatch }),
+    ])
+    return c.json({
+      success: true,
+      decisions: { windows, unix },
+      windowsUpdates: await windowsUpdateBundle(auth.session.tenant_id),
+    })
+  })
+
   app.post('/api/v1/rmm/windows-updates/evaluate', async (c) => {
     const auth = await requirePatchAccess(c, 'policy')
     if (auth.error) return auth.error
@@ -5199,6 +5505,9 @@ export function registerRmmPatchingRoutes(app) {
       softwareEnabled ? object(body.softwareRules).maintenanceWindow : body.maintenanceWindow,
     )
     const windowsRules = windowsEnabled ? normalizeWindowsRules(body.windowsRules, deploymentDelayDays) : {}
+    if (windowsEnabled && !Object.values(object(windowsRules.platforms)).some(Boolean)) {
+      return c.json({ error: 'Select at least one OS patch platform: Windows, Linux or macOS.' }, 400)
+    }
     const softwareRules = softwareEnabled ? normalizeSoftwareRules(body.softwareRules, maintenanceWindow) : {}
     const softwareValidation = await validateSoftwareRuleCatalogueIds(auth.session.tenant_id, softwareRules, softwareEnabled)
     if (softwareValidation.error) return c.json({ error: softwareValidation.error }, 400)
@@ -5247,6 +5556,9 @@ export function registerRmmPatchingRoutes(app) {
       softwareEnabled ? object(body.softwareRules).maintenanceWindow : body.maintenanceWindow,
     )
     const windowsRules = windowsEnabled ? normalizeWindowsRules(body.windowsRules, deploymentDelayDays) : {}
+    if (windowsEnabled && !Object.values(object(windowsRules.platforms)).some(Boolean)) {
+      return c.json({ error: 'Select at least one OS patch platform: Windows, Linux or macOS.' }, 400)
+    }
     const softwareRules = softwareEnabled ? normalizeSoftwareRules(body.softwareRules, maintenanceWindow) : {}
     const softwareValidation = await validateSoftwareRuleCatalogueIds(auth.session.tenant_id, softwareRules, softwareEnabled)
     if (softwareValidation.error) return c.json({ error: softwareValidation.error }, 400)
