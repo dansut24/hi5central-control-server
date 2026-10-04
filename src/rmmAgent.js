@@ -30,8 +30,12 @@ const TENANT_INSTALLER_API_BASE = process.env.TENANT_INSTALLER_API_BASE || 'http
 const TENANT_INSTALLER_ARTIFACT_DIR = process.env.TENANT_INSTALLER_ARTIFACT_DIR || '/srv/tenant-installers'
 const TENANT_INSTALLER_MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
 const TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH = process.env.TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH || path.join(TENANT_INSTALLER_ARTIFACT_DIR, 'templates', 'Hi5CentralAgentTemplate.exe')
+const TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH = process.env.TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH || path.join(TENANT_INSTALLER_ARTIFACT_DIR, 'templates', 'Hi5CentralAgentTemplate.msi')
 const TENANT_INSTALLER_EXE_CONFIG_MAGIC = Buffer.from('H5C0F9A17D42B6E3', 'ascii')
 const TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE = 512
+const TENANT_INSTALLER_MSI_ID_MARKER = Buffer.from('H5MSI_ID_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
+const TENANT_INSTALLER_MSI_SECRET_MARKER = Buffer.from('H5MSI_SECRET_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
+const TENANT_INSTALLER_MSI_API_MARKER = Buffer.from('H5MSI_API_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
 const TENANT_INSTALLER_GENERIC_URLS = {
   exe: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.exe',
   msi: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.msi',
@@ -128,14 +132,14 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
   const format = clean(formatValue).toLowerCase()
   const definition = TENANT_INSTALLER_ASSETS[format]
   if (!definition || definition.platform !== platform) return null
-  if (platform === 'windows' && format !== 'exe') return null
+  if (platform === 'windows' && !['exe', 'msi'].includes(format)) return null
   return { platform, format, definition }
 }
 
 function tenantInstallerInstallCommand(formatValue = '') {
   const format = clean(formatValue).toLowerCase()
   if (format === 'exe') return '.\\Hi5CentralAgent.exe --quiet'
-  if (format === 'msi') return 'msiexec /i "Hi5CentralAgentDeployment-Windows.msi" /qn HI5DEPLOYMENTCONFIG="%CD%\\Hi5CentralDeployment.json"'
+  if (format === 'msi') return 'msiexec /i "Hi5CentralAgent.msi" /qn /norestart'
   if (format === 'run') return 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
   if (format === 'deb') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo dpkg -i ./hi5central-agent-deployment_amd64.deb'
   if (format === 'rpm') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo rpm -U ./hi5central-agent-deployment_x86_64.rpm'
@@ -151,29 +155,60 @@ function writeFixedInstallerField(buffer, offset, capacity, value) {
   encoded.copy(buffer, offset)
 }
 
-function windowsTenantInstallerBuffer(packageId) {
-  if (!existsSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)) {
-    throw new Error('Windows tenant installer template is not published.')
+function writeFixedTemplateMarker(buffer, marker, value) {
+  const encoded = Buffer.from(String(value || ''), 'utf8')
+  if (!marker?.length || encoded.length > marker.length) {
+    throw new Error('Tenant installer template field is too long.')
+  }
+  const first = buffer.indexOf(marker)
+  const last = buffer.lastIndexOf(marker)
+  if (first < 0 || first !== last) {
+    throw new Error('Tenant installer template marker is invalid.')
+  }
+  buffer.fill(0x20, first, first + marker.length)
+  encoded.copy(buffer, first)
+}
+
+function windowsTenantInstallerBuffer(packageId, formatValue = 'exe') {
+  const format = clean(formatValue).toLowerCase()
+  if (format === 'exe') {
+    if (!existsSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)) {
+      throw new Error('Windows EXE tenant installer template is not published.')
+    }
+
+    const template = readFileSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)
+    const first = template.indexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+    const last = template.lastIndexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+    if (first < 0 || first !== last || first + TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE > template.length) {
+      throw new Error('Windows EXE tenant installer template configuration block is invalid.')
+    }
+
+    const output = Buffer.from(template)
+    const blockStart = first
+    writeFixedInstallerField(output, blockStart + 24, 64, packageId)
+    writeFixedInstallerField(output, blockStart + 24 + 64, 128, tenantInstallerDeploymentSecret(packageId))
+    writeFixedInstallerField(output, blockStart + 24 + 64 + 128, 256, TENANT_INSTALLER_API_BASE)
+    return output
   }
 
-  const template = readFileSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)
-  const first = template.indexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
-  const last = template.lastIndexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
-  if (first < 0 || first !== last || first + TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE > template.length) {
-    throw new Error('Windows tenant installer template configuration block is invalid.')
+  if (format === 'msi') {
+    if (!existsSync(TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH)) {
+      throw new Error('Windows MSI tenant installer template is not published.')
+    }
+
+    const output = Buffer.from(readFileSync(TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH))
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_ID_MARKER, packageId)
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_SECRET_MARKER, tenantInstallerDeploymentSecret(packageId))
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_API_MARKER, TENANT_INSTALLER_API_BASE)
+    return output
   }
 
-  const output = Buffer.from(template)
-  const blockStart = first
-  writeFixedInstallerField(output, blockStart + 24, 64, packageId)
-  writeFixedInstallerField(output, blockStart + 24 + 64, 128, tenantInstallerDeploymentSecret(packageId))
-  writeFixedInstallerField(output, blockStart + 24 + 64 + 128, 256, TENANT_INSTALLER_API_BASE)
-  return output
+  throw new Error('Unsupported Windows tenant installer format.')
 }
 
 function tenantInstallerUrl(packageId, formatValue = '') {
   const format = clean(formatValue).toLowerCase()
-  if (format === 'exe') {
+  if (['exe', 'msi'].includes(format)) {
     return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/installer'
   }
   return TENANT_INSTALLER_GENERIC_URLS[format] || null
@@ -1042,7 +1077,7 @@ export function registerRmmAgentRoutes(app) {
       installer_url: pkg.persistent && pkg.installer_format
         ? tenantInstallerUrl(pkg.id, pkg.installer_format)
         : null,
-      deployment_config_url: pkg.persistent && pkg.installer_format !== 'exe'
+      deployment_config_url: pkg.persistent && !['exe', 'msi'].includes(pkg.installer_format)
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
         : null,
       install_command: pkg.persistent ? tenantInstallerInstallCommand(pkg.installer_format) : null,
@@ -1086,7 +1121,7 @@ export function registerRmmAgentRoutes(app) {
         selection?.platform || null, selection?.format || null],
     )
     const pkg = result.rows[0]
-    const externalDeploymentConfig = persistent && pkg.installer_format !== 'exe'
+    const externalDeploymentConfig = persistent && !['exe', 'msi'].includes(pkg.installer_format)
     const deploymentSecret = externalDeploymentConfig ? tenantInstallerDeploymentSecret(pkg.id) : ''
     const deploymentConfig = externalDeploymentConfig ? {
       schemaVersion: 1,
@@ -1141,23 +1176,26 @@ export function registerRmmAgentRoutes(app) {
     const pkg = result.rows[0]
     if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
     if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
-    if (pkg.installer_platform !== 'windows' || pkg.installer_format !== 'exe') {
-      return c.json({ error: 'This installer record is not a Windows EXE.' }, 409)
+    if (pkg.installer_platform !== 'windows' || !['exe', 'msi'].includes(pkg.installer_format)) {
+      return c.json({ error: 'This installer record is not a supported Windows installer.' }, 409)
     }
 
     let installer
     try {
-      installer = windowsTenantInstallerBuffer(packageId)
+      installer = windowsTenantInstallerBuffer(packageId, pkg.installer_format)
     } catch (error) {
       return c.json({ error: clean(error?.message || error) || 'Windows installer is unavailable.' }, 503)
     }
 
+    const isMsi = pkg.installer_format === 'msi'
     return new Response(installer, {
       status: 200,
       headers: {
-        'Content-Type': 'application/vnd.microsoft.portable-executable',
+        'Content-Type': isMsi ? 'application/x-msi' : 'application/vnd.microsoft.portable-executable',
         'Content-Length': String(installer.length),
-        'Content-Disposition': 'attachment; filename="Hi5CentralAgent.exe"',
+        'Content-Disposition': isMsi
+          ? 'attachment; filename="Hi5CentralAgent.msi"'
+          : 'attachment; filename="Hi5CentralAgent.exe"',
         'Cache-Control': 'private, no-store',
       },
     })
