@@ -340,6 +340,61 @@ export function registerRmmRemoteRoutes(app) {
     }, 201)
   })
 
+  app.post('/api/v1/rmm/devices/:agentDeviceId/wayland-persistence/forget', async (c) => {
+    const auth = await requireRemoteAccess(c)
+    if (auth.error) return auth.error
+
+    const agent = await agentForRemoteSession(
+      auth.session.tenant_id,
+      clean(c.req.param('agentDeviceId')),
+    )
+    if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+    if (remoteEndpointPlatform(agent) !== 'linux') {
+      return c.json({ error: 'Remembered Wayland access is only available for Linux endpoints.' }, 409)
+    }
+
+    const liveSocket = agentSocketForDevice(agent.id)
+    if (!liveSocket || liveSocket.readyState !== 1) {
+      return c.json({ error: 'The Hi5Central Agent is currently offline.' }, 409)
+    }
+
+    const requestId = randomUUID()
+    if (!safeSend(liveSocket, {
+      type: 'forget_wayland_remote_access',
+      request_id: requestId,
+    })) {
+      return c.json({ error: 'Unable to send the forget request to the Agent.' }, 409)
+    }
+
+    const actorLabel = clean(auth.session.name || auth.session.email) || 'Technician'
+    recordRmmActivity({
+      tenantId: auth.session.tenant_id,
+      agentDeviceId: agent.id,
+      inventoryId: agent.inventory_id,
+      actorUserId: auth.session.user_id,
+      actorType: 'technician',
+      actorLabel,
+      eventType: 'remote.wayland_persistence_forgotten',
+      category: 'remote',
+      summary: actorLabel + ' cleared remembered Wayland access',
+      detail: 'Hi5Central requested removal of the stored restore token for the active Linux desktop user.',
+      outcome: 'success',
+      severity: 'info',
+      metadata: {
+        platform: 'linux',
+        limitedFeature: true,
+        requestId,
+      },
+    }).catch(() => {})
+
+    return c.json({
+      success: true,
+      requestId,
+      limited: true,
+      message: 'Remembered Wayland access was cleared for the active Linux user.',
+    }, 202)
+  })
+
   app.get('/api/v1/rmm/remote-sessions', async (c) => {
     const auth = await requireRemoteAccess(c)
     if (auth.error) return auth.error
