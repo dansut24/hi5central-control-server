@@ -335,7 +335,7 @@ function compareVersions(installed, target) {
 }
 async function patchDeviceRows(tenantId) {
   const result = await pool.query(
-    `SELECT i.id AS inventory_id,i.reference,i.name,i.source_payload,
+    `SELECT i.id AS inventory_id,i.reference,i.name,i.operating_system,i.source_payload,
             a.id AS agent_device_id,a.agent_version,a.websocket_status,a.last_telemetry_at,
             a.patch_capabilities,a.patch_capabilities_at,a.patch_discovery_at,
             p.name AS assigned_person_name,p.email AS assigned_person_email,
@@ -1618,7 +1618,7 @@ export async function reconcilePatchDeployments(tenantId) {
 
 async function patchBundle(tenantId) {
   await reconcilePatchDeployments(tenantId)
-  const [devices, catalogue, policies, assignments, vulnerabilities, discovery, vendorIntel, tenantVendorSources, exposureSummary, softwareVulnerabilityExposures, vulnerabilityExposureRowsData, deployments, vulnerabilityCatalogue, devicePatchRejections, qualificationQueue, windowsUpdates] = await Promise.all([
+  const [devices, catalogue, policies, assignments, vulnerabilities, discovery, vendorIntel, tenantVendorSources, exposureSummary, softwareVulnerabilityExposures, vulnerabilityExposureRowsData, deployments, vulnerabilityCatalogue, devicePatchRejections, qualificationQueue, windowsUpdates, unixOsSchedules] = await Promise.all([
     patchDeviceRows(tenantId),
     catalogueRows(tenantId),
     policyRows(tenantId),
@@ -1635,6 +1635,7 @@ async function patchBundle(tenantId) {
     devicePatchRejectionRows(tenantId),
     qualificationQueueSummary(tenantId),
     windowsUpdateBundle(tenantId),
+    evaluateUnixOsPatchPolicies(tenantId, { dispatch: false }),
   ])
   const software = buildSoftware(devices, catalogue, discovery.observations)
   const vulnerabilityHydration = await vulnerabilityHydrationRows(software.deviceSoftware)
@@ -1667,6 +1668,7 @@ async function patchBundle(tenantId) {
     assignments,
     deployments,
     windowsUpdates,
+    unixOsSchedules,
     vulnerabilities,
     vulnerabilityExposures: exposureSummary,
     softwareVulnerabilityExposures,
