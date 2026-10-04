@@ -30,7 +30,7 @@ const TENANT_INSTALLER_API_BASE = process.env.TENANT_INSTALLER_API_BASE || 'http
 const TENANT_INSTALLER_ARTIFACT_DIR = process.env.TENANT_INSTALLER_ARTIFACT_DIR || '/srv/tenant-installers'
 const TENANT_INSTALLER_MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
 const TENANT_INSTALLER_GENERIC_URLS = {
-  exe: 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe',
+  exe: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.exe',
   msi: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.msi',
   app: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.app.zip',
   pkg: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.pkg',
@@ -126,6 +126,18 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
   const definition = TENANT_INSTALLER_ASSETS[format]
   if (!definition || definition.platform !== platform) return null
   return { platform, format, definition }
+}
+
+function tenantInstallerInstallCommand(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (format === 'exe') return '.\\Hi5CentralAgentDeployment-Windows.exe --quiet --config ".\\Hi5CentralDeployment.json"'
+  if (format === 'msi') return 'msiexec /i "Hi5CentralAgentDeployment-Windows.msi" /qn HI5DEPLOYMENTCONFIG="%CD%\\Hi5CentralDeployment.json"'
+  if (format === 'run') return 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
+  if (format === 'deb') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo dpkg -i ./hi5central-agent-deployment_amd64.deb'
+  if (format === 'rpm') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo rpm -U ./hi5central-agent-deployment_x86_64.rpm'
+  if (format === 'pkg') return 'Place Hi5CentralDeployment.json at /Library/Application Support/Hi5Central/Deployment.json before installing the PKG.'
+  if (format === 'dmg' || format === 'app') return 'Place Hi5CentralDeployment.json beside the app or in Downloads, then open the Hi5Central Agent app.'
+  return ''
 }
 
 function tenantInstallerHmacKey() {
@@ -897,7 +909,9 @@ async function ingestInventory(agent, payload) {
       [agent.inventory_id],
     )
     const previousPayload = previousResult.rows[0]?.source_payload && typeof previousResult.rows[0].source_payload === 'object'
-      ? previousResult.rows[0].source_payload      : {}    const effectivePayload = mergeRetainedDeepInventory(previousPayload, payload)
+      ? previousResult.rows[0].source_payload
+      : {}
+    const effectivePayload = mergeRetainedDeepInventory(previousPayload, payload)
 
     await client.query(
       `UPDATE rmm_device_inventory SET
@@ -992,6 +1006,7 @@ export function registerRmmAgentRoutes(app) {
       deployment_config_url: pkg.persistent
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
         : null,
+      install_command: pkg.persistent ? tenantInstallerInstallCommand(pkg.installer_format) : null,
     }))
     return c.json({
       packages,
@@ -1043,17 +1058,7 @@ export function registerRmmAgentRoutes(app) {
     } : null
 
     const installCommand = persistent
-      ? pkg.installer_format === 'msi'
-        ? 'msiexec /i "Hi5CentralAgentDeployment-Windows.msi" /qn HI5DEPLOYMENTCONFIG="%CD%\\Hi5CentralDeployment.json"'
-        : pkg.installer_format === 'exe'
-          ? '.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DEPLOYMENT_CONFIG=".\\Hi5CentralDeployment.json" /INSTALL_SOURCE="deployment-json"'
-          : pkg.installer_format === 'run'
-            ? 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
-            : pkg.installer_format === 'deb'
-              ? 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo dpkg -i ./hi5central-agent-deployment_amd64.deb'
-              : pkg.installer_format === 'rpm'
-                ? 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo rpm -U ./hi5central-agent-deployment_x86_64.rpm'
-                : ''
+      ? tenantInstallerInstallCommand(pkg.installer_format)
       : `.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ENROLLMENT_TOKEN="${token}" /TENANT_ID="${auth.session.tenant_id}" /PACKAGE_ID="${pkg.id}" /INSTALL_SOURCE="rmm-portal"`
 
     return c.json({
