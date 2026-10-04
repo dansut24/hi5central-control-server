@@ -937,6 +937,7 @@ async function packageRows(tenantId) {
             persistent,artifact_build_requested_at,artifact_build_completed_at,artifact_build_error
        FROM rmm_agent_enrollment_packages
       WHERE tenant_id=$1
+        AND parent_deployment_id IS NULL
       ORDER BY created_at DESC
       LIMIT 25`,
     [tenantId],
@@ -1270,7 +1271,7 @@ export function registerRmmAgentRoutes(app) {
       success: true,
       format,
       sha256: actualSha256,
-      sizeBytes: bytes.length,
+      sizeBytes,
       readyCount,
       totalCount: artifacts.length,
     }, 201)
@@ -1555,10 +1556,78 @@ export function registerRmmAgentRoutes(app) {
     }, 202)
   })
 
+  app.post('/api/v1/agent/deployments/:deploymentId/enrollment-token', async (c) => {
+    const deploymentId = clean(c.req.param('deploymentId'))
+    if (!isUuid(deploymentId)) {
+      return c.json({ success: false, error: 'A valid deployment ID is required.' }, 400)
+    }
+
+    const body = await c.req.json().catch(() => ({}))
+    const deploymentSecret = clean(body.deploymentSecret || body.deployment_secret)
+    if (!deploymentSecret || deploymentSecret.length > 200) {
+      return c.json({ success: false, error: 'A valid deployment secret is required.' }, 400)
+    }
+
+    const issued = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT id,tenant_id,persistent,revoked_at
+           FROM rmm_agent_enrollment_packages
+          WHERE id=$1
+          FOR UPDATE`,
+        [deploymentId],
+      )
+      const deployment = result.rows[0]
+      if (!deployment || !deployment.persistent) {
+        return { error: 'Agent deployment is invalid.', status: 401 }
+      }
+      if (deployment.revoked_at) {
+        return { error: 'Agent deployment has been revoked.', status: 410 }
+      }
+
+      const expectedSecret = tenantInstallerDeploymentSecret(deployment.id)
+      if (!constantTimeTextEqual(deploymentSecret, expectedSecret)) {
+        return { error: 'Agent deployment credentials are invalid.', status: 401 }
+      }
+
+      const token = secret('h5e')
+      const child = await client.query(
+        `INSERT INTO rmm_agent_enrollment_packages
+           (tenant_id,label,token_hash,token_hint,expires_at,max_uses,
+            created_by_user_id,persistent,parent_deployment_id)
+         VALUES ($1,'Tenant installer bootstrap',$2,$3,now()+interval '10 minutes',
+                 1,NULL,false,$4)
+         RETURNING id,expires_at`,
+        [deployment.tenant_id, sha256(token), token.slice(-6), deployment.id],
+      )
+
+      return {
+        token,
+        tenantId: deployment.tenant_id,
+        packageId: child.rows[0].id,
+        expiresAt: child.rows[0].expires_at,
+      }
+    })
+
+    if (issued.error) {
+      return c.json({ success: false, error: issued.error }, issued.status || 400)
+    }
+
+    c.header('Cache-Control', 'no-store')
+    const accept = clean(c.req.header('accept')).toLowerCase()
+    if (accept.includes('text/plain')) return c.text(issued.token, 201)
+    return c.json({
+      success: true,
+      enrollmentToken: issued.token,
+      tenantId: issued.tenantId,
+      packageId: issued.packageId,
+      expiresAt: issued.expiresAt,
+    }, 201)
+  })
+
   app.post('/api/v1/agent/enroll', async (c) => {
     const body = await c.req.json().catch(() => ({}))
     const enrollmentToken = clean(body.enrollmentToken || body.enrollment_token)
-    const deploymentId = clean(body.deploymentId || body.deployment_id || body.package_id)
+    const deploymentId = clean(body.deploymentId || body.deployment_id)
     const deploymentSecret = clean(body.deploymentSecret || body.deployment_secret)
     if (enrollmentToken.length > 200) return c.json({ success: false, error: 'Enrollment token is too long.' }, 400)
     if (deploymentSecret.length > 200) return c.json({ success: false, error: 'Deployment secret is too long.' }, 400)
@@ -1575,16 +1644,20 @@ export function registerRmmAgentRoutes(app) {
 
     const enrolled = await withTransaction(async (client) => {
       const packageResult = await client.query(
-        `SELECT id,tenant_id,max_uses,use_count,expires_at,revoked_at,persistent
-           FROM rmm_agent_enrollment_packages
-          WHERE (token_hash=$1 AND NULLIF($2,'') IS NULL)
-             OR (id=NULLIF($2,'')::uuid AND persistent=true)
-          FOR UPDATE`,
+        `SELECT p.id,p.tenant_id,p.max_uses,p.use_count,p.expires_at,p.revoked_at,
+                p.persistent,p.parent_deployment_id,parent.revoked_at AS parent_revoked_at
+           FROM rmm_agent_enrollment_packages p
+           LEFT JOIN rmm_agent_enrollment_packages parent ON parent.id=p.parent_deployment_id
+          WHERE (p.token_hash=$1 AND NULLIF($2,'') IS NULL)
+             OR (p.id=NULLIF($2,'')::uuid AND p.persistent=true)
+          FOR UPDATE OF p`,
         [tokenHash, deploymentId],
       )
       const pkg = packageResult.rows[0]
       if (!pkg) return { error: deploymentId ? 'Agent deployment is invalid.' : 'Enrollment token is invalid.', status: 401 }
-      if (pkg.revoked_at) return { error: 'Agent deployment has been revoked.', status: 410 }
+      if (pkg.revoked_at || pkg.parent_revoked_at) {
+        return { error: pkg.persistent || pkg.parent_deployment_id ? 'Agent deployment has been revoked.' : 'Enrollment token has been revoked.', status: 410 }
+      }
       if (pkg.persistent) {
         const expectedSecret = tenantInstallerDeploymentSecret(pkg.id)
         if (!deploymentSecret || !constantTimeTextEqual(deploymentSecret, expectedSecret)) {
