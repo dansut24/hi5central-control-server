@@ -128,6 +128,7 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
   const format = clean(formatValue).toLowerCase()
   const definition = TENANT_INSTALLER_ASSETS[format]
   if (!definition || definition.platform !== platform) return null
+  if (platform === 'windows' && format !== 'exe') return null
   return { platform, format, definition }
 }
 
