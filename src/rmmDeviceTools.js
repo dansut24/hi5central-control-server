@@ -56,7 +56,33 @@ async function requireDeviceView(c) {
 
 function payloadForAction(type, body = {}) {
   const payload = body?.payload && typeof body.payload === 'object' && !Array.isArray(body.payload) ? body.payload : {}
-  if (['processes.list', 'services.list', 'inventory.scan'].includes(type)) return {}
+  if (['processes.list', 'services.list', 'inventory.scan', 'os.update.scan'].includes(type)) return {}
+  if (type === 'os.update.install') {
+    const rawIds = payload.update_ids ?? payload.updateIds ?? []
+    if (!Array.isArray(rawIds)) throw new Error('OS update IDs must be an array.')
+
+    const updateIds = [...new Set(rawIds
+      .filter((value) => typeof value === 'string')
+      .map((value) => clean(value).slice(0, 512))
+      .filter(Boolean))]
+      .slice(0, 1000)
+
+    const all = payload.all === true
+    const securityOnly = payload.security_only === true || payload.securityOnly === true
+    const allowFeatureUpgrade =
+      payload.allow_feature_upgrade === true || payload.allowFeatureUpgrade === true
+
+    if (!all && !updateIds.length) {
+      throw new Error('Select at least one operating-system update or request all eligible updates.')
+    }
+
+    return {
+      update_ids: updateIds,
+      all,
+      security_only: securityOnly,
+      allow_feature_upgrade: allowFeatureUpgrade,
+    }
+  }
   if (['process.kill', 'process.restart'].includes(type)) {
     const pid = boundedInteger(payload.pid ?? payload.processId, 5, 2147483647)
     if (!pid) throw new Error('A valid process ID is required.')
@@ -306,6 +332,16 @@ export function registerRmmDeviceToolRoutes(app) {
 
     const platform = clean(device.platform || device.operating_system).toLowerCase()
     const isUnix = platform.includes('linux') || platform.includes('mac')
+    if (['os.update.scan', 'os.update.install'].includes(type) && !isUnix) {
+      return c.json({ error: 'Native OS update actions are currently available on managed Linux/macOS endpoints only.' }, 400)
+    }
+    if (isUnix && ['os.update.scan', 'os.update.install'].includes(type) && !versionAtLeast(device.agent_version, '0.3.103')) {
+      return c.json({
+        error: 'Hi5Central Agent 0.3.103 or newer is required for native Unix OS updates.',
+        upgradeRequired: true,
+        requiredAgentVersion: '0.3.103',
+      }, 426)
+    }
     if (type === 'software.update' && !isUnix) {
       return c.json({ error: 'Native software update actions are currently available on managed Linux/macOS endpoints only.' }, 400)
     }
