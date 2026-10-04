@@ -29,6 +29,9 @@ const TENANT_INSTALLER_REF = process.env.TENANT_INSTALLER_REF || 'main'
 const TENANT_INSTALLER_API_BASE = process.env.TENANT_INSTALLER_API_BASE || 'https://api.hi5central.com'
 const TENANT_INSTALLER_ARTIFACT_DIR = process.env.TENANT_INSTALLER_ARTIFACT_DIR || '/srv/tenant-installers'
 const TENANT_INSTALLER_MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
+const TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH = process.env.TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH || path.join(TENANT_INSTALLER_ARTIFACT_DIR, 'templates', 'Hi5CentralAgentTemplate.exe')
+const TENANT_INSTALLER_EXE_CONFIG_MAGIC = Buffer.from('H5C0F9A17D42B6E3', 'ascii')
+const TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE = 512
 const TENANT_INSTALLER_GENERIC_URLS = {
   exe: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.exe',
   msi: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.msi',
@@ -130,7 +133,7 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
 
 function tenantInstallerInstallCommand(formatValue = '') {
   const format = clean(formatValue).toLowerCase()
-  if (format === 'exe') return '.\\Hi5CentralAgentDeployment-Windows.exe --quiet --config ".\\Hi5CentralDeployment.json"'
+  if (format === 'exe') return '.\\Hi5CentralAgent.exe --quiet'
   if (format === 'msi') return 'msiexec /i "Hi5CentralAgentDeployment-Windows.msi" /qn HI5DEPLOYMENTCONFIG="%CD%\\Hi5CentralDeployment.json"'
   if (format === 'run') return 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
   if (format === 'deb') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo dpkg -i ./hi5central-agent-deployment_amd64.deb'
@@ -138,6 +141,41 @@ function tenantInstallerInstallCommand(formatValue = '') {
   if (format === 'pkg') return 'Place Hi5CentralDeployment.json at /Library/Application Support/Hi5Central/Deployment.json before installing the PKG.'
   if (format === 'dmg' || format === 'app') return 'Place Hi5CentralDeployment.json beside the app or in Downloads, then open the Hi5Central Agent app.'
   return ''
+}
+
+function writeFixedInstallerField(buffer, offset, capacity, value) {
+  const encoded = Buffer.from(String(value || ''), 'utf8')
+  if (encoded.length >= capacity) throw new Error('Tenant installer embedded field is too long.')
+  buffer.fill(0, offset, offset + capacity)
+  encoded.copy(buffer, offset)
+}
+
+function windowsTenantInstallerBuffer(packageId) {
+  if (!existsSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)) {
+    throw new Error('Windows tenant installer template is not published.')
+  }
+
+  const template = readFileSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)
+  const first = template.indexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+  const last = template.lastIndexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+  if (first < 0 || first !== last || first + TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE > template.length) {
+    throw new Error('Windows tenant installer template configuration block is invalid.')
+  }
+
+  const output = Buffer.from(template)
+  const blockStart = first
+  writeFixedInstallerField(output, blockStart + 24, 64, packageId)
+  writeFixedInstallerField(output, blockStart + 24 + 64, 128, tenantInstallerDeploymentSecret(packageId))
+  writeFixedInstallerField(output, blockStart + 24 + 64 + 128, 256, TENANT_INSTALLER_API_BASE)
+  return output
+}
+
+function tenantInstallerUrl(packageId, formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (format === 'exe') {
+    return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/installer'
+  }
+  return TENANT_INSTALLER_GENERIC_URLS[format] || null
 }
 
 function tenantInstallerHmacKey() {
@@ -1001,9 +1039,9 @@ export function registerRmmAgentRoutes(app) {
     const packages = (await packageRows(auth.session.tenant_id)).map((pkg) => ({
       ...pkg,
       installer_url: pkg.persistent && pkg.installer_format
-        ? TENANT_INSTALLER_GENERIC_URLS[pkg.installer_format] || null
+        ? tenantInstallerUrl(pkg.id, pkg.installer_format)
         : null,
-      deployment_config_url: pkg.persistent
+      deployment_config_url: pkg.persistent && pkg.installer_format !== 'exe'
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
         : null,
       install_command: pkg.persistent ? tenantInstallerInstallCommand(pkg.installer_format) : null,
@@ -1047,8 +1085,9 @@ export function registerRmmAgentRoutes(app) {
         selection?.platform || null, selection?.format || null],
     )
     const pkg = result.rows[0]
-    const deploymentSecret = persistent ? tenantInstallerDeploymentSecret(pkg.id) : ''
-    const deploymentConfig = persistent ? {
+    const externalDeploymentConfig = persistent && pkg.installer_format !== 'exe'
+    const deploymentSecret = externalDeploymentConfig ? tenantInstallerDeploymentSecret(pkg.id) : ''
+    const deploymentConfig = externalDeploymentConfig ? {
       schemaVersion: 1,
       apiBase: TENANT_INSTALLER_API_BASE,
       deploymentId: pkg.id,
@@ -1066,15 +1105,15 @@ export function registerRmmAgentRoutes(app) {
       deploymentId: persistent ? pkg.id : null,
       enrollmentToken: persistent ? null : token,
       deploymentConfig,
-      deploymentConfigUrl: persistent
+      deploymentConfigUrl: externalDeploymentConfig
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
         : null,
       installer: persistent ? {
         platform: pkg.installer_platform,
         format: pkg.installer_format,
-        url: TENANT_INSTALLER_GENERIC_URLS[pkg.installer_format] || null,
+        url: tenantInstallerUrl(pkg.id, pkg.installer_format),
       } : null,
-      downloadUrl: persistent ? TENANT_INSTALLER_GENERIC_URLS[pkg.installer_format] : AGENT_DOWNLOAD_URL,
+      downloadUrl: persistent ? tenantInstallerUrl(pkg.id, pkg.installer_format) : AGENT_DOWNLOAD_URL,
       installCommand,
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
@@ -1082,6 +1121,45 @@ export function registerRmmAgentRoutes(app) {
         linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.175' },
       },
     }, 201)
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/installer', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    if (pkg.installer_platform !== 'windows' || pkg.installer_format !== 'exe') {
+      return c.json({ error: 'This installer record is not a Windows EXE.' }, 409)
+    }
+
+    let installer
+    try {
+      installer = windowsTenantInstallerBuffer(packageId)
+    } catch (error) {
+      return c.json({ error: clean(error?.message || error) || 'Windows installer is unavailable.' }, 503)
+    }
+
+    return new Response(installer, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.microsoft.portable-executable',
+        'Content-Length': String(installer.length),
+        'Content-Disposition': 'attachment; filename="Hi5CentralAgent.exe"',
+        'Cache-Control': 'private, no-store',
+      },
+    })
   })
 
   app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/deployment-config', async (c) => {
@@ -1100,6 +1178,9 @@ export function registerRmmAgentRoutes(app) {
     const pkg = result.rows[0]
     if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
     if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    if (pkg.installer_format === 'exe') {
+      return c.json({ error: 'Windows EXE deployment credentials are embedded server-side in Hi5CentralAgent.exe.' }, 409)
+    }
 
     c.header('Content-Disposition', 'attachment; filename="Hi5CentralDeployment.json"')
     c.header('Cache-Control', 'private, no-store')
