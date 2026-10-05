@@ -104,22 +104,36 @@ function payloadForAction(type, body = {}) {
     }
     return { path, name, value, kind }
   }
-  if (type === 'software.uninstall') {
+  if (type === 'software.uninstall' || type === 'software.update') {
     const name = clean(payload.name).slice(0, 512)
-    const registryKey = clean(payload.registry_key || payload.registryKey).slice(0, 512)
+    const registryKey = clean(payload.registry_key || payload.registryKey).slice(0, 1024)
     const scope = clean(payload.scope).slice(0, 192)
     const userProfile = clean(payload.user_profile || payload.userProfile).slice(0, 1024)
-    if (!name && !registryKey) throw new Error('Software name or registry identity is required.')
-    const validScope = !scope || ['machine64', 'machine32', 'user'].includes(scope) || /^user:S-1-(?:5-21|12-1)-[0-9-]+$/i.test(scope)
+    const packageManager = clean(payload.package_manager || payload.packageManager).toLowerCase().slice(0, 64)
+    const packageId = clean(payload.package_id || payload.packageId).slice(0, 512)
+    const latestVersion = clean(payload.latest_version || payload.latestVersion).slice(0, 128)
+    if (!name && !registryKey && !packageId) throw new Error('Software name or package identity is required.')
+    const validScope = !scope || ['machine64', 'machine32', 'user', 'system'].includes(scope) || /^user:S-1-(?:5-21|12-1)-[0-9-]+$/i.test(scope)
     if (!validScope) throw new Error('Unsupported software scope.')
-    return { name, registry_key: registryKey, scope, user_profile: userProfile }
+    if (packageManager && !['apt', 'snap', 'flatpak', 'app_bundle'].includes(packageManager)) {
+      throw new Error('Unsupported native package manager.')
+    }
+    return {
+      name,
+      registry_key: registryKey,
+      scope,
+      user_profile: userProfile,
+      package_manager: packageManager,
+      package_id: packageId,
+      latest_version: latestVersion,
+    }
   }
   throw new Error('Unsupported device action.')
 }
 
 async function managedAgent(tenantId, agentDeviceId) {
   const result = await pool.query(
-    "SELECT a.id,a.agent_version,i.id AS inventory_id,i.name,i.reference " +
+    "SELECT a.id,a.agent_version,i.id AS inventory_id,i.name,i.reference,i.platform,i.operating_system " +
     "FROM rmm_agent_devices a " +
     "JOIN rmm_device_inventory i ON i.id=a.inventory_id " +
     "WHERE a.id::text=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true LIMIT 1",
@@ -289,6 +303,20 @@ export function registerRmmDeviceToolRoutes(app) {
 
     const device = await managedAgent(auth.session.tenant_id, agentDeviceId)
     if (!device) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+
+    const platform = clean(device.platform || device.operating_system).toLowerCase()
+    const isUnix = platform.includes('linux') || platform.includes('mac')
+    if (type === 'software.update' && !isUnix) {
+      return c.json({ error: 'Native software update actions are currently available on managed Linux/macOS endpoints only.' }, 400)
+    }
+    if (isUnix && ['software.update', 'software.uninstall'].includes(type) && !versionAtLeast(device.agent_version, '0.3.40')) {
+      return c.json({
+        error: 'Hi5Central Agent 0.3.40 or newer is required for native Unix software actions.',
+        upgradeRequired: true,
+        requiredAgentVersion: '0.3.40',
+      }, 426)
+    }
+
     const liveSocket = agentSocketForDevice(device.id)
     if (!liveSocket || liveSocket.readyState !== 1) {
       return c.json({ error: 'This device is offline. No job was queued.', offline: true }, 409)
@@ -414,10 +442,38 @@ export function registerRmmDeviceToolRoutes(app) {
     const body = await c.req.json().catch(() => ({}))
     const tool = clean(body.tool || 'terminal').toLowerCase()
     const shell = clean(body.shell || 'powershell').toLowerCase()
-    const runAs = clean(body.runAs || body.run_as || 'system').toLowerCase()
+    const requestedRunAs = clean(body.runAs || body.run_as || 'system').toLowerCase()
+    const platform = clean(device.platform || device.operating_system).toLowerCase()
+    const isUnix = platform.includes('linux') || platform.includes('mac')
+    const runAs = isUnix
+      ? (requestedRunAs === 'system' ? 'root' : requestedRunAs)
+      : requestedRunAs
+
+    if (isUnix && !versionAtLeast(device.agent_version, '0.3.27')) {
+      return c.json({
+        error: 'Hi5Central Agent 0.3.27 or newer is required for Unix Terminal and Files.',
+        upgradeRequired: true,
+        requiredAgentVersion: '0.3.27',
+      }, 426)
+    }
+
     if (!['terminal', 'files'].includes(tool)) return c.json({ error: 'Unsupported live tool session.' }, 400)
-    if (tool === 'terminal' && !['cmd', 'powershell'].includes(shell)) return c.json({ error: 'Terminal shell must be cmd or powershell.' }, 400)
-    if (tool === 'terminal' && !['system', 'user'].includes(runAs)) return c.json({ error: 'Terminal execution context must be user or system.' }, 400)
+
+    if (tool === 'terminal') {
+      if (isUnix && !['shell', 'bash', 'zsh', 'sh'].includes(shell)) {
+        return c.json({ error: 'Unix terminal shell must be shell, bash, zsh or sh.' }, 400)
+      }
+      if (!isUnix && !['cmd', 'powershell'].includes(shell)) {
+        return c.json({ error: 'Windows terminal shell must be cmd or powershell.' }, 400)
+      }
+    }
+
+    if (isUnix && !['root', 'user'].includes(runAs)) {
+      return c.json({ error: 'Unix execution context must be user or root.' }, 400)
+    }
+    if (!isUnix && !['system', 'user'].includes(runAs)) {
+      return c.json({ error: 'Windows execution context must be user or system.' }, 400)
+    }
 
     const id = randomUUID()
     const token = 'h5t_' + randomBytes(32).toString('base64url')
@@ -437,7 +493,7 @@ export function registerRmmDeviceToolRoutes(app) {
       deviceName: device.name,
       tool,
       shell,
-      runAs: tool === 'terminal' ? runAs : '',
+      runAs,
       tokenHash: sha256(token),
       expiresAt,
       transcript: '',
@@ -448,7 +504,7 @@ export function registerRmmDeviceToolRoutes(app) {
     const cleanup = setTimeout(() => toolSessions.delete(id), TOOL_SESSION_TTL_MS + 5000)
     cleanup.unref?.()
     return c.json({
-      session: { id, tool, shell, runAs: tool === 'terminal' ? runAs : '', deviceName: device.name, expiresAt: new Date(expiresAt).toISOString() },
+      session: { id, tool, shell, runAs, deviceName: device.name, expiresAt: new Date(expiresAt).toISOString() },
       token,
       websocketPath: '/rmm-tools/ws',
     }, 201)
@@ -519,8 +575,13 @@ export function attachRmmDeviceToolWebSocket(server) {
       "UPDATE rmm_tool_sessions SET status='active',started_at=COALESCE(started_at,now()),updated_at=now() WHERE id=$1 AND tenant_id=$2",
       [sessionId, session.tenantId],
     ).catch(() => {})
-    const toolLabel = isTerminal ? (session.shell === 'cmd' ? 'Command Prompt' : 'PowerShell') : 'File Browser'
-    const terminalContextLabel = session.runAs === 'user' ? 'signed-in user' : 'SYSTEM'
+    const isUnixSession = ['shell','bash','zsh','sh'].includes(session.shell) || session.runAs === 'root'
+    const toolLabel = isTerminal
+      ? (isUnixSession ? 'Unix Shell' : (session.shell === 'cmd' ? 'Command Prompt' : 'PowerShell'))
+      : 'File Browser'
+    const executionContextLabel = session.runAs === 'user'
+      ? 'signed-in user'
+      : (session.runAs === 'root' ? 'root' : 'SYSTEM')
     recordRmmActivity({
       tenantId: session.tenantId,
       agentDeviceId: session.agentDeviceId,
@@ -530,8 +591,8 @@ export function attachRmmDeviceToolWebSocket(server) {
       actorLabel: session.actorLabel,
       eventType: isTerminal ? 'terminal.started' : 'files.session_started',
       category: isTerminal ? 'terminal' : 'files',
-      summary: session.actorLabel + ' started a ' + toolLabel + (isTerminal ? ' session as ' + terminalContextLabel : ' session'),
-      detail: isTerminal ? 'Live terminal started in the ' + terminalContextLabel + ' execution context.' : 'Live device tool session started.',
+      summary: session.actorLabel + ' started a ' + toolLabel + ' session as ' + executionContextLabel,
+      detail: 'Live ' + (isTerminal ? 'terminal' : 'file browser') + ' started in the ' + executionContextLabel + ' execution context.',
       outcome: 'success',
       toolSessionId: sessionId,
       metadata: { tool: session.tool, shell: session.shell, runAs: session.runAs || '' },
@@ -674,6 +735,8 @@ export function attachRmmDeviceToolWebSocket(server) {
         outgoing.rows = boundedInteger(payload.rows, 5, 100) || 32
       }
       if (isFiles) {
+        outgoing.run_as = session.runAs || 'system'
+        outgoing.runAs = session.runAs || 'system'
         if (outgoing.path != null) outgoing.path = clean(outgoing.path).slice(0, 4096)
         if (outgoing.currentPath != null) outgoing.currentPath = clean(outgoing.currentPath).slice(0, 4096)
         if (outgoing.current_path != null) outgoing.current_path = clean(outgoing.current_path).slice(0, 4096)
