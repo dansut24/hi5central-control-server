@@ -1,5 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { chmodSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -138,22 +140,13 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
 
 function linuxTenantInstallerInstallCommand(formatValue = '') {
   const format = clean(formatValue).toLowerCase()
-  const fileName = format === 'run'
-    ? 'Hi5CentralAgentDeployment-Linux.run'
-    : format === 'deb'
-      ? 'hi5central-agent-deployment_amd64.deb'
-      : format === 'rpm'
-        ? 'hi5central-agent-deployment_x86_64.rpm'
-        : ''
+  if (format === 'deb') return 'sudo dpkg -i ./hi5centralagent.deb'
+  if (format === 'rpm') return 'sudo rpm -Uvh ./hi5centralagent.rpm'
+  if (format !== 'run') return ''
+
+  const fileName = 'Hi5CentralAgentDeployment-Linux.run'
   const bundleName = linuxTenantInstallerBundleName(format)
-  const installCommand = format === 'run'
-    ? 'if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl tar; elif command -v yum >/dev/null 2>&1; then yum install -y curl tar; else echo "curl and tar are required before installing the Hi5Central Agent."; exit 1; fi; fi && chmod 0755 "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" && "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" --config "$HI5_DIR/Hi5CentralDeployment.json"'
-    : format === 'deb'
-      ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get -f install -y || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -f install -y; }; DEBIAN_FRONTEND=noninteractive apt-get install -y "$HI5_DIR/hi5central-agent-deployment_amd64.deb" || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$HI5_DIR/hi5central-agent-deployment_amd64.deb"; }; else dpkg -i "$HI5_DIR/hi5central-agent-deployment_amd64.deb"; fi'
-      : format === 'rpm'
-        ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && if command -v dnf >/dev/null 2>&1; then dnf install -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; elif command -v yum >/dev/null 2>&1; then yum localinstall -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; else rpm -U "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; fi'
-        : ''
-  if (!fileName || !bundleName || !installCommand) return ''
+  const installCommand = 'if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl tar; elif command -v yum >/dev/null 2>&1; then yum install -y curl tar; else echo "curl and tar are required before installing the Hi5Central Agent."; exit 1; fi; fi && chmod 0755 "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" && "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" --config "$HI5_DIR/Hi5CentralDeployment.json"'
   return '(' + [
     'HI5_DIR="$PWD"',
     'HI5_EXTRACT=""',
@@ -162,7 +155,7 @@ function linuxTenantInstallerInstallCommand(formatValue = '') {
     'if { [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/' + fileName + '" ]; } && [ -f "$HI5_BUNDLE" ]; then command -v tar >/dev/null 2>&1 || { echo "tar is required to unpack the Hi5Central deployment bundle."; exit 1; }; HI5_EXTRACT="$(mktemp -d /tmp/hi5central-deploy.XXXXXX)" || exit 1; tar -xzf "$HI5_BUNDLE" -C "$HI5_EXTRACT" || { rm -rf "$HI5_EXTRACT"; exit 1; }; HI5_DIR="$HI5_EXTRACT"; fi',
     '[ -f "$HI5_DIR/Hi5CentralDeployment.json" ] && [ -f "$HI5_DIR/' + fileName + '" ] || { echo "Hi5Central deployment bundle or installer files were not found in the current folder or Downloads."; [ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"; exit 1; }',
     'HI5_INSTALL=' + JSON.stringify(installCommand),
-    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\\\"$HI5_DIR\\\" /bin/sh -c \'$HI5_INSTALL\'"; HI5_STATUS=$?; fi',
+    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\"$HI5_DIR\" /bin/sh -c \'$HI5_INSTALL\'"; HI5_STATUS=$?; fi',
     '[ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"',
     'exit "$HI5_STATUS"',
   ].join('; ') + ')'
@@ -238,7 +231,7 @@ function windowsTenantInstallerBuffer(packageId, formatValue = 'exe') {
 
 function tenantInstallerUrl(packageId, formatValue = '') {
   const format = clean(formatValue).toLowerCase()
-  if (['exe', 'msi'].includes(format)) {
+  if (['exe', 'msi', 'deb', 'rpm'].includes(format)) {
     return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/installer'
   }
   return TENANT_INSTALLER_GENERIC_URLS[format] || null
@@ -246,7 +239,7 @@ function tenantInstallerUrl(packageId, formatValue = '') {
 function tenantInstallerBundleUrl(packageId, platformValue = '', formatValue = '') {
   const platform = clean(platformValue).toLowerCase()
   const format = clean(formatValue).toLowerCase()
-  if (platform !== 'linux' || !['run', 'deb', 'rpm'].includes(format)) return null
+  if (platform !== 'linux' || format !== 'run') return null
   return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/bundle'
 }
 
@@ -299,6 +292,260 @@ function tenantInstallerDeploymentConfig(pkg) {
     deploymentSecret: tenantInstallerDeploymentSecret(pkg.id),
     installerPlatform: pkg.installer_platform,
     installerFormat: pkg.installer_format,
+  }
+}
+
+
+function runPackagingCommand(command, args, cwd = undefined) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, HOME: process.env.HOME || '/tmp' },
+  })
+  if (result.error) {
+    throw new Error(command + ' is unavailable in the API container: ' + result.error.message)
+  }
+  if (result.status !== 0) {
+    const detail = clean(result.stderr || result.stdout).slice(0, 2000)
+    throw new Error(command + ' failed' + (detail ? ': ' + detail : '.'))
+  }
+}
+
+async function currentLinuxPackageVersion() {
+  try {
+    const response = await fetch(PORTABLE_AGENT_RELEASE_MANIFEST_URL, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(4_000),
+    })
+    if (!response.ok) throw new Error('manifest HTTP ' + response.status)
+    const manifest = await response.json()
+    const version = clean(manifest?.platforms?.linux?.version)
+    if (/^\d+\.\d+\.\d+$/.test(version)) return version
+  } catch {}
+  return '0.3.0'
+}
+
+function linuxTenantPackageServiceUnit() {
+  return `[Unit]
+Description=Hi5Central Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/hi5central/agent/Hi5CentralAgent --state-dir /var/lib/hi5central/agent --deployment-config /etc/hi5central/deployment.json --service
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+RuntimeDirectory=hi5central
+RuntimeDirectoryMode=0755
+ReadWritePaths=/var/lib/hi5central/agent /var/lib/hi5central/portal /run/hi5central /etc/hi5central
+
+[Install]
+WantedBy=multi-user.target
+`
+}
+
+function linuxTenantPackageDesktopEntry() {
+  return `[Desktop Entry]
+Type=Application
+Name=Hi5Central Remote Helper
+Comment=Hi5Central remote desktop session helper
+Exec=/opt/hi5central/agent/Hi5CentralRemoteHelper --remote-helper
+TryExec=/opt/hi5central/agent/Hi5CentralRemoteHelper
+Icon=computer
+Terminal=false
+NoDisplay=true
+Categories=System;RemoteAccess;
+`
+}
+
+async function linuxTenantInstallerPackage(pkg) {
+  const format = clean(pkg?.installer_format).toLowerCase()
+  if (clean(pkg?.installer_platform).toLowerCase() !== 'linux' || !['deb', 'rpm'].includes(format)) {
+    throw new Error('This deployment is not a supported self-contained Linux installer.')
+  }
+
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'hi5central-linux-package-'))
+  try {
+    const response = await fetch(AGENT_DOWNLOAD_URL_LINUX, { signal: AbortSignal.timeout(45_000) })
+    if (!response.ok) throw new Error('Linux Agent payload download failed HTTP ' + response.status + '.')
+    const archive = Buffer.from(await response.arrayBuffer())
+    if (!archive.length || archive.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+      throw new Error('Linux Agent payload has an invalid size.')
+    }
+
+    const archivePath = path.join(tempRoot, 'agent.tar.gz')
+    const extractRoot = path.join(tempRoot, 'payload')
+    const packageRoot = path.join(tempRoot, 'root')
+    writeFileSync(archivePath, archive, { mode: 0o600 })
+    mkdirSync(extractRoot, { recursive: true, mode: 0o700 })
+    runPackagingCommand('tar', ['-xzf', archivePath, '-C', extractRoot])
+
+    const sourceAgent = path.join(extractRoot, 'Hi5CentralAgent')
+    const sourceHelper = path.join(extractRoot, 'Hi5CentralRemoteHelper')
+    if (!existsSync(sourceAgent) || !existsSync(sourceHelper)) {
+      throw new Error('Published Linux Agent payload is incomplete.')
+    }
+
+    const installDir = path.join(packageRoot, 'opt', 'hi5central', 'agent')
+    const configDir = path.join(packageRoot, 'etc', 'hi5central')
+    const systemdDir = path.join(packageRoot, 'etc', 'systemd', 'system')
+    const desktopDir = path.join(packageRoot, 'usr', 'share', 'applications')
+    mkdirSync(installDir, { recursive: true, mode: 0o755 })
+    mkdirSync(configDir, { recursive: true, mode: 0o700 })
+    mkdirSync(systemdDir, { recursive: true, mode: 0o755 })
+    mkdirSync(desktopDir, { recursive: true, mode: 0o755 })
+
+    const agentPath = path.join(installDir, 'Hi5CentralAgent')
+    const helperPath = path.join(installDir, 'Hi5CentralRemoteHelper')
+    copyFileSync(sourceAgent, agentPath)
+    copyFileSync(sourceHelper, helperPath)
+    chmodSync(agentPath, 0o755)
+    chmodSync(helperPath, 0o755)
+
+    writeFileSync(
+      path.join(configDir, 'deployment.json'),
+      JSON.stringify(tenantInstallerDeploymentConfig(pkg), null, 2) + '\n',
+      { mode: 0o600 },
+    )
+    writeFileSync(
+      path.join(systemdDir, 'hi5central-agent.service'),
+      linuxTenantPackageServiceUnit(),
+      { mode: 0o644 },
+    )
+    writeFileSync(
+      path.join(desktopDir, 'com.hi5central.RemoteHelper.desktop'),
+      linuxTenantPackageDesktopEntry(),
+      { mode: 0o644 },
+    )
+
+    const version = await currentLinuxPackageVersion()
+
+    if (format === 'deb') {
+      const debianDir = path.join(packageRoot, 'DEBIAN')
+      mkdirSync(debianDir, { recursive: true, mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'control'), `Package: hi5central-agent
+Version: ${version}
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Hi5Central <hello@hi5central.com>
+Conflicts: hi5central-agent-deployment
+Replaces: hi5central-agent-deployment
+Description: Hi5Central RMM Agent
+ Self-contained Hi5Central Agent with a revocable tenant deployment credential.
+`)
+      const postinst = `#!/bin/sh
+set +e
+install -d -m 0700 /var/lib/hi5central/agent
+install -d -m 0755 /var/lib/hi5central/portal
+install -d -m 0755 /run/hi5central
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable hi5central-agent.service >/dev/null 2>&1 || true
+systemctl restart hi5central-agent.service >/dev/null 2>&1 || true
+exit 0
+`
+      const prerm = `#!/bin/sh
+set +e
+if [ "$1" = "remove" ]; then
+  systemctl stop hi5central-agent.service >/dev/null 2>&1 || true
+  systemctl disable hi5central-agent.service >/dev/null 2>&1 || true
+fi
+exit 0
+`
+      const postrm = `#!/bin/sh
+set +e
+systemctl daemon-reload >/dev/null 2>&1 || true
+exit 0
+`
+      writeFileSync(path.join(debianDir, 'postinst'), postinst, { mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'prerm'), prerm, { mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'postrm'), postrm, { mode: 0o755 })
+
+      const outputPath = path.join(tempRoot, 'hi5centralagent.deb')
+      runPackagingCommand('dpkg-deb', ['--build', '--root-owner-group', packageRoot, outputPath])
+      const output = readFileSync(outputPath)
+      if (!output.length || output.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+        throw new Error('Generated DEB has an invalid size.')
+      }
+      return output
+    }
+
+    const topdir = path.join(tempRoot, 'rpmbuild')
+    for (const name of ['BUILD', 'BUILDROOT', 'RPMS', 'SOURCES', 'SPECS', 'SRPMS']) {
+      mkdirSync(path.join(topdir, name), { recursive: true, mode: 0o755 })
+    }
+    const specPath = path.join(topdir, 'SPECS', 'hi5central-agent.spec')
+    const spec = `Name: hi5central-agent
+Version: ${version}
+Release: 1
+Summary: Hi5Central RMM Agent
+License: Proprietary
+BuildArch: x86_64
+AutoReqProv: no
+Conflicts: hi5central-agent-deployment
+
+%description
+Self-contained Hi5Central Agent with a revocable tenant deployment credential.
+
+%prep
+%build
+%install
+mkdir -p %{buildroot}
+cp -a %{payload_root}/. %{buildroot}/
+rm -rf %{buildroot}/DEBIAN
+
+%post
+install -d -m 0700 /var/lib/hi5central/agent
+install -d -m 0755 /var/lib/hi5central/portal
+install -d -m 0755 /run/hi5central
+systemctl daemon-reload >/dev/null 2>&1 || :
+systemctl enable hi5central-agent.service >/dev/null 2>&1 || :
+systemctl restart hi5central-agent.service >/dev/null 2>&1 || :
+
+%preun
+if [ "$1" -eq 0 ]; then
+  systemctl stop hi5central-agent.service >/dev/null 2>&1 || :
+  systemctl disable hi5central-agent.service >/dev/null 2>&1 || :
+fi
+
+%postun
+systemctl daemon-reload >/dev/null 2>&1 || :
+
+%files
+%dir /opt/hi5central
+%dir /opt/hi5central/agent
+/opt/hi5central/agent/Hi5CentralAgent
+/opt/hi5central/agent/Hi5CentralRemoteHelper
+%dir /etc/hi5central
+%config(noreplace) /etc/hi5central/deployment.json
+/etc/systemd/system/hi5central-agent.service
+/usr/share/applications/com.hi5central.RemoteHelper.desktop
+`
+    writeFileSync(specPath, spec, { mode: 0o644 })
+    runPackagingCommand('rpmbuild', [
+      '-bb',
+      '--define', '_topdir ' + topdir,
+      '--define', 'payload_root ' + packageRoot,
+      specPath,
+    ])
+
+    const outputPath = path.join(topdir, 'RPMS', 'x86_64', `hi5central-agent-${version}-1.x86_64.rpm`)
+    if (!existsSync(outputPath)) throw new Error('Generated RPM output was not found.')
+    const output = readFileSync(outputPath)
+    if (!output.length || output.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+      throw new Error('Generated RPM has an invalid size.')
+    }
+    return output
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
   }
 }
 
