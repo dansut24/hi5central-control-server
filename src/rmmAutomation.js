@@ -16,6 +16,21 @@ function boundedInteger(value, min, max, fallback) {
 }
 function asObject(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {} }
 function asArray(value) { return Array.isArray(value) ? value : [] }
+function normalizeAutomationPlatform(value = '') {
+  const platform = clean(value).toLowerCase()
+  if (['mac', 'darwin', 'osx'].includes(platform)) return 'macos'
+  if (['win', 'win32'].includes(platform)) return 'windows'
+  if (['windows', 'macos', 'linux'].includes(platform)) return platform
+  return ''
+}
+function platformLanguage(platform) { return platform === 'windows' ? 'powershell' : 'shell' }
+function inventoryPlatform(value = '') {
+  const platform = clean(value).toLowerCase()
+  if (platform.includes('win')) return 'windows'
+  if (platform.includes('mac') || platform.includes('darwin') || platform.includes('os x')) return 'macos'
+  if (platform.includes('linux')) return 'linux'
+  return ''
+}
 
 async function requireAccess(c, permissions) {
   const session = await resolveSession(c)
@@ -112,13 +127,16 @@ export function registerRmmAutomationRoutes(app) {
     if (!scriptText.trim()) return c.json({ error: 'Automation script cannot be empty.' }, 400)
     if (Buffer.byteLength(scriptText, 'utf8') > 512 * 1024) return c.json({ error: 'Automation script is too large.' }, 413)
     const timeoutSeconds = boundedInteger(body.timeoutSeconds, 5, 3600, 120)
+    const platform = normalizeAutomationPlatform(body.platform || 'windows')
+    if (!platform) return c.json({ error: 'Automation platform must be Windows, macOS or Linux.' }, 400)
+    const language = platformLanguage(platform)
     const result = await withTransaction(async (client) => {
       const automation = await client.query(
         `INSERT INTO rmm_automations
           (tenant_id,name,description,category,platform,language,status,created_by_user_id,updated_by_user_id)
-         VALUES ($1,$2,$3,$4,'windows','powershell','draft',$5,$5)
+         VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,$7)
          RETURNING id`,
-        [auth.session.tenant_id, name, clean(body.description).slice(0, 2000), clean(body.category).slice(0, 80) || 'General', auth.session.user_id],
+        [auth.session.tenant_id, name, clean(body.description).slice(0, 2000), clean(body.category).slice(0, 80) || 'General', platform, language, auth.session.user_id],
       )
       const automationId = automation.rows[0].id
       await client.query(
@@ -139,18 +157,32 @@ export function registerRmmAutomationRoutes(app) {
     const body = await c.req.json().catch(() => ({}))
     const updated = await withTransaction(async (client) => {
       const found = await client.query(
-        `SELECT id,status FROM rmm_automations WHERE id=$1 AND tenant_id=$2 AND status<>'archived' FOR UPDATE`,
+        `SELECT id,status,platform,language,published_version_id FROM rmm_automations WHERE id=$1 AND tenant_id=$2 AND status<>'archived' FOR UPDATE`,
         [automationId, auth.session.tenant_id],
       )
       if (!found.rowCount) return false
+      const current = found.rows[0]
+      const requestedPlatform = body.platform === undefined
+        ? normalizeAutomationPlatform(current.platform)
+        : normalizeAutomationPlatform(body.platform)
+      if (!requestedPlatform) throw new Error('Automation platform must be Windows, macOS or Linux.')
+      if (current.published_version_id && requestedPlatform !== normalizeAutomationPlatform(current.platform)) {
+        throw new Error('Published automations cannot change operating system. Create a new automation for another OS.')
+      }
+      const currentPlatform = normalizeAutomationPlatform(current.platform)
+      const currentLanguage = clean(current.language).toLowerCase()
+      const requestedLanguage = requestedPlatform === currentPlatform && requestedPlatform === 'windows' && ['powershell', 'cmd'].includes(currentLanguage)
+        ? currentLanguage
+        : platformLanguage(requestedPlatform)
       await client.query(
         `UPDATE rmm_automations SET
            name=COALESCE(NULLIF($3,''),name),
            description=COALESCE($4,description),
            category=COALESCE(NULLIF($5,''),category),
-           updated_by_user_id=$6,updated_at=now()
+           platform=$6,language=$7,
+           updated_by_user_id=$8,updated_at=now()
          WHERE id=$1 AND tenant_id=$2`,
-        [automationId, auth.session.tenant_id, clean(body.name).slice(0, 160), body.description === undefined ? null : clean(body.description).slice(0, 2000), clean(body.category).slice(0, 80), auth.session.user_id],
+        [automationId, auth.session.tenant_id, clean(body.name).slice(0, 160), body.description === undefined ? null : clean(body.description).slice(0, 2000), clean(body.category).slice(0, 80), requestedPlatform, requestedLanguage, auth.session.user_id],
       )
       if (body.scriptText !== undefined) {
         const scriptText = String(body.scriptText ?? '')
@@ -224,7 +256,7 @@ export function registerRmmAutomationRoutes(app) {
     if (!requestedIds.length) return c.json({ error: 'Select at least one managed device.' }, 400)
     const queued = await withTransaction(async (client) => {
       const automation = await client.query(
-        `SELECT a.id,a.name,a.published_version_id,v.script_text,v.timeout_seconds,v.run_as,v.version_number,v.content_sha256
+        `SELECT a.id,a.name,a.platform,a.language,a.published_version_id,v.script_text,v.timeout_seconds,v.run_as,v.version_number,v.content_sha256
            FROM rmm_automations a
            JOIN rmm_automation_versions v ON v.id=a.published_version_id AND v.state='published'
           WHERE a.id=$1 AND a.tenant_id=$2 AND a.status='published'`,
@@ -234,17 +266,25 @@ export function registerRmmAutomationRoutes(app) {
       const version = automation.rows[0]
       if (version.run_as !== 'system') return { status: 400, error: 'Current-user execution is not enabled in this Agent build yet.' }
       const targets = await client.query(
-        `SELECT id FROM rmm_agent_devices WHERE tenant_id=$1 AND disabled_at IS NULL AND id=ANY($2::uuid[])`,
+        `SELECT a.id,i.platform
+           FROM rmm_agent_devices a
+           JOIN rmm_device_inventory i ON i.id=a.inventory_id
+          WHERE a.tenant_id=$1 AND a.disabled_at IS NULL AND a.id=ANY($2::uuid[])`,
         [auth.session.tenant_id, requestedIds],
       )
       if (!targets.rowCount) return { status: 404, error: 'No valid managed Agent targets were found.' }
-      const onlineTargets = targets.rows.filter((target) => {
+      const compatibleTargets = targets.rows.filter((target) => inventoryPlatform(target.platform) === normalizeAutomationPlatform(version.platform))
+      const incompatibleTargets = targets.rows.filter((target) => !compatibleTargets.some((compatible) => compatible.id === target.id))
+      if (!compatibleTargets.length) {
+        return { status: 409, error: 'No selected devices match this automation operating system.', incompatibleDeviceIds: incompatibleTargets.map((target) => target.id) }
+      }
+      const onlineTargets = compatibleTargets.filter((target) => {
         const socket = agentSocketForDevice(target.id)
         return socket && socket.readyState === 1
       })
-      const offlineTargets = targets.rows.filter((target) => !onlineTargets.some((online) => online.id === target.id))
+      const offlineTargets = compatibleTargets.filter((target) => !onlineTargets.some((online) => online.id === target.id))
       if (!onlineTargets.length) {
-        return { status: 409, error: 'All selected devices are offline. No jobs were queued.', offlineDeviceIds: offlineTargets.map((target) => target.id) }
+        return { status: 409, error: 'All compatible selected devices are offline. No jobs were queued.', offlineDeviceIds: offlineTargets.map((target) => target.id) }
       }
 
       const correlationId = randomUUID()
@@ -256,7 +296,7 @@ export function registerRmmAutomationRoutes(app) {
             (tenant_id,agent_device_id,job_type,payload,queued_by_user_id,automation_id,automation_version_id,initiated_by,initiated_by_label,correlation_id,request_metadata)
            VALUES ($1,$2,'custom.command',$3::jsonb,$4,$5,$6,'technician',$7,$8,$9::jsonb)
            RETURNING id`,
-          [auth.session.tenant_id, target.id, JSON.stringify({ command: version.script_text, timeout_seconds: version.timeout_seconds }), auth.session.user_id, automationId, version.published_version_id, label, correlationId, JSON.stringify({ automation_name: version.name, version_number: version.version_number, content_sha256: version.content_sha256 })],
+          [auth.session.tenant_id, target.id, JSON.stringify({ command: version.script_text, timeout_seconds: version.timeout_seconds, ...(normalizeAutomationPlatform(version.platform) === 'windows' ? {} : { run_as: 'root' }) }), auth.session.user_id, automationId, version.published_version_id, label, correlationId, JSON.stringify({ automation_name: version.name, automation_platform: version.platform, version_number: version.version_number, content_sha256: version.content_sha256 })],
         )
         ids.push(inserted.rows[0].id)
       }
@@ -267,6 +307,8 @@ export function registerRmmAutomationRoutes(app) {
         correlationId,
         skippedOffline: offlineTargets.length,
         skippedOfflineDeviceIds: offlineTargets.map((target) => target.id),
+        skippedIncompatible: incompatibleTargets.length,
+        skippedIncompatibleDeviceIds: incompatibleTargets.map((target) => target.id),
       }
     })
     if (queued.error) return c.json({ error: queued.error }, queued.status)
@@ -343,10 +385,10 @@ export function registerRmmAutomationRoutes(app) {
       if (actions.length) {
         const ids = [...new Set(actions.map((action) => clean(action.automationId)).filter(Boolean))]
         const found = await client.query(
-          `SELECT a.id,a.name,a.published_version_id,v.version_number
+          `SELECT a.id,a.name,a.platform,a.published_version_id,v.version_number
              FROM rmm_automations a
              JOIN rmm_automation_versions v ON v.id=a.published_version_id AND v.state='published'
-            WHERE a.tenant_id=$1 AND a.status='published' AND a.id=ANY($2::uuid[])`,
+            WHERE a.tenant_id=$1 AND a.status='published' AND a.platform='windows' AND a.id=ANY($2::uuid[])`,
           [auth.session.tenant_id, ids],
         )
         for (const row of found.rows) published.set(row.id, row)
