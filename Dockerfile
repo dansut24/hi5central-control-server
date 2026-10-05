@@ -3,7 +3,8 @@ FROM node:24-alpine
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev \
+    && apk add --no-cache binutils coreutils dpkg file findutils grep rpm tar
 
 COPY migrations ./migrations
 COPY src ./src
