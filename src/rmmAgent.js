@@ -136,13 +136,37 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
   return { platform, format, definition }
 }
 
+function linuxTenantInstallerInstallCommand(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  const fileName = format === 'run'
+    ? 'Hi5CentralAgentDeployment-Linux.run'
+    : format === 'deb'
+      ? 'hi5central-agent-deployment_amd64.deb'
+      : format === 'rpm'
+        ? 'hi5central-agent-deployment_x86_64.rpm'
+        : ''
+  const installCommand = format === 'run'
+    ? 'chmod 0755 "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" && "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" --config "$HI5_DIR/Hi5CentralDeployment.json"'
+    : format === 'deb'
+      ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && dpkg -i "$HI5_DIR/hi5central-agent-deployment_amd64.deb"'
+      : format === 'rpm'
+        ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && rpm -U "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"'
+        : ''
+  if (!fileName || !installCommand) return ''
+  return [
+    'HI5_DIR="$PWD"',
+    `if [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/${fileName}" ]; then HI5_DOWNLOADS="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DOWNLOAD 2>/dev/null || true)"; [ -n "$HI5_DOWNLOADS" ] || HI5_DOWNLOADS="$HOME/Downloads"; HI5_DIR="$HI5_DOWNLOADS"; fi`,
+    `[ -f "$HI5_DIR/Hi5CentralDeployment.json" ] && [ -f "$HI5_DIR/${fileName}" ] || { echo "Hi5Central installer files were not found in the current folder or Downloads."; exit 1; }`,
+    `HI5_INSTALL='${installCommand}'`,
+    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\\\"$HI5_DIR\\\" /bin/sh -c \'$HI5_INSTALL\'"; fi',
+  ].join('; ')
+}
+
 function tenantInstallerInstallCommand(formatValue = '') {
   const format = clean(formatValue).toLowerCase()
   if (format === 'exe') return '.\\Hi5CentralAgent.exe --quiet'
   if (format === 'msi') return 'msiexec /i "Hi5CentralAgent.msi" /qn /norestart'
-  if (format === 'run') return 'sudo ./Hi5CentralAgentDeployment-Linux.run --config ./Hi5CentralDeployment.json'
-  if (format === 'deb') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo dpkg -i ./hi5central-agent-deployment_amd64.deb'
-  if (format === 'rpm') return 'sudo install -d -m 700 /etc/hi5central && sudo install -m 600 ./Hi5CentralDeployment.json /etc/hi5central/deployment.json && sudo rpm -U ./hi5central-agent-deployment_x86_64.rpm'
+  if (['run', 'deb', 'rpm'].includes(format)) return linuxTenantInstallerInstallCommand(format)
   if (format === 'pkg') return 'Place Hi5CentralDeployment.json at /Library/Application Support/Hi5Central/Deployment.json before installing the PKG.'
   if (format === 'dmg' || format === 'app') return 'Place Hi5CentralDeployment.json beside the app or in Downloads, then open the Hi5Central Agent app.'
   return ''
