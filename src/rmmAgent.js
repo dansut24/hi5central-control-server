@@ -1441,7 +1441,7 @@ export function registerRmmAgentRoutes(app) {
       bundle_url: pkg.persistent
         ? tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format)
         : null,
-      deployment_config_url: pkg.persistent && !['exe', 'msi'].includes(pkg.installer_format)
+      deployment_config_url: pkg.persistent && !['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
         : null,
       install_command: pkg.persistent ? tenantInstallerInstallCommand(pkg.installer_format) : null,
@@ -1485,7 +1485,7 @@ export function registerRmmAgentRoutes(app) {
         selection?.platform || null, selection?.format || null],
     )
     const pkg = result.rows[0]
-    const externalDeploymentConfig = persistent && !['exe', 'msi'].includes(pkg.installer_format)
+    const externalDeploymentConfig = persistent && !['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)
     const deploymentSecret = externalDeploymentConfig ? tenantInstallerDeploymentSecret(pkg.id) : ''
     const deploymentConfig = externalDeploymentConfig ? {
       schemaVersion: 1,
