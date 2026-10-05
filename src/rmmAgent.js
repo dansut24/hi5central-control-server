@@ -154,7 +154,7 @@ function linuxTenantInstallerInstallCommand(formatValue = '') {
         ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && if command -v dnf >/dev/null 2>&1; then dnf install -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; elif command -v yum >/dev/null 2>&1; then yum localinstall -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; else rpm -U "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; fi'
         : ''
   if (!fileName || !bundleName || !installCommand) return ''
-  return [
+  return '(' + [
     'HI5_DIR="$PWD"',
     'HI5_EXTRACT=""',
     'HI5_BUNDLE="$HI5_DIR/' + bundleName + '"',
@@ -165,7 +165,7 @@ function linuxTenantInstallerInstallCommand(formatValue = '') {
     'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\\\"$HI5_DIR\\\" /bin/sh -c \'$HI5_INSTALL\'"; HI5_STATUS=$?; fi',
     '[ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"',
     'exit "$HI5_STATUS"',
-  ].join('; ')
+  ].join('; ') + ')'
 }
 
 function tenantInstallerInstallCommand(formatValue = '') {
