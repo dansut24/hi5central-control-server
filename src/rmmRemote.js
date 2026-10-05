@@ -9,7 +9,11 @@ import { recordRmmActivity } from './rmmActivity.js'
 import { resolveSession } from './session.js'
 
 const ROOT_DOMAIN = deployment.rootDomain
-const VIEWER_DOWNLOAD_URL = process.env.VIEWER_DOWNLOAD_URL || `https://downloads.${ROOT_DOMAIN}/viewer/latest/Hi5CentralViewerSetup.exe`
+const DOWNLOADS_URL = String(process.env.DOWNLOADS_URL || `https://downloads.${ROOT_DOMAIN}`).replace(/\/$/, '')
+const VIEWER_DOWNLOAD_URL_WINDOWS = process.env.VIEWER_DOWNLOAD_URL_WINDOWS || process.env.VIEWER_DOWNLOAD_URL || `${DOWNLOADS_URL}/viewer/latest/Hi5CentralViewerSetup.exe`
+const VIEWER_DOWNLOAD_URL_MACOS = process.env.VIEWER_DOWNLOAD_URL_MACOS || `${DOWNLOADS_URL}/viewer/latest/Hi5CentralViewer-macOS.dmg`
+const VIEWER_DOWNLOAD_URL_LINUX = process.env.VIEWER_DOWNLOAD_URL_LINUX || `${DOWNLOADS_URL}/viewer/latest/hi5central-viewer_amd64.deb`
+const VIEWER_RELEASE_MANIFEST_URL = process.env.VIEWER_RELEASE_MANIFEST_URL || `${DOWNLOADS_URL}/viewer/latest/manifest.json`
 const VIEWER_WS_URL = process.env.VIEWER_WS_URL || `wss://rmm.${ROOT_DOMAIN}/viewer/ws`
 const TURN_HOST = process.env.TURN_HOST || `turn.${ROOT_DOMAIN}`
 const TURN_SHARED_SECRET_FILE = process.env.TURN_SHARED_SECRET_FILE || '/run/secrets/turn_shared_secret'
@@ -19,6 +23,7 @@ const MAX_VIEWER_PAYLOAD_BYTES = 8 * 1024 * 1024
 const VIEWER_RECONNECT_GRACE_MS = 90 * 1000
 const AGENT_RESTART_GRACE_MS = 10 * 60 * 1000
 const activeViewerSessions = new Map()
+let viewerReleaseManifestCache = { expiresAt: 0, value: null }
 
 const VIEWER_MESSAGE_TYPES = new Set([
   'webrtc_answer', 'answer', 'ice_candidate',
@@ -47,6 +52,55 @@ function viewerClientForRequest(c, requestedClient = '') {
   if (requested === 'browser' || requested === 'native') return requested
   const mobileHint = clean(c.req.header('sec-ch-ua-mobile')).toLowerCase()
   return mobileHint === '?1' || isPortableUserAgent(c.req.header('user-agent')) ? 'browser' : 'native'
+}
+
+function viewerPlatformForRequest(c, requestedPlatform = '') {
+  const requested = clean(requestedPlatform).toLowerCase()
+  if (['windows', 'macos', 'linux'].includes(requested)) return requested
+
+  const platformHint = clean(c.req.header('sec-ch-ua-platform')).replace(/^"|"$/g, '').toLowerCase()
+  const userAgent = clean(c.req.header('user-agent')).toLowerCase()
+  const combined = `${platformHint} ${userAgent}`
+  if (/windows|win32|win64/.test(combined)) return 'windows'
+  if (/macos|macintosh|mac os x/.test(combined)) return 'macos'
+  if (/linux|x11|ubuntu|fedora|debian/.test(combined) && !/android/.test(combined)) return 'linux'
+  return 'unknown'
+}
+
+function viewerDownloadUrlForPlatform(platform = '') {
+  if (platform === 'macos') return VIEWER_DOWNLOAD_URL_MACOS
+  if (platform === 'linux') return VIEWER_DOWNLOAD_URL_LINUX
+  if (platform === 'windows') return VIEWER_DOWNLOAD_URL_WINDOWS
+  return null
+}
+
+async function viewerReleaseManifest() {
+  const now = Date.now()
+  if (viewerReleaseManifestCache.value && viewerReleaseManifestCache.expiresAt > now) {
+    return viewerReleaseManifestCache.value
+  }
+  try {
+    const response = await fetch(VIEWER_RELEASE_MANIFEST_URL, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(2500),
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const manifest = await response.json()
+    viewerReleaseManifestCache = { value: manifest, expiresAt: now + 60_000 }
+    return manifest
+  } catch {
+    return null
+  }
+}
+
+async function viewerReleaseForPlatform(platform = '') {
+  const fallbackUrl = viewerDownloadUrlForPlatform(platform)
+  const manifest = await viewerReleaseManifest()
+  const release = manifest?.platforms?.[platform]
+  return {
+    version: clean(release?.version),
+    url: clean(release?.url) || fallbackUrl,
+  }
 }
 function safeSend(ws, payload) {
   if (!ws || ws.readyState !== 1) return false
@@ -122,6 +176,7 @@ function browserLaunchUrl(slug, payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
     ice,
   })
   const base = tenantUrls(slug, { rmm: true }).rmmUrl || `https://${slug}-rmm.${ROOT_DOMAIN}`
@@ -135,6 +190,7 @@ function nativeLaunchUrl(payload) {
     token: payload.token,
     wss_url: payload.wssUrl,
     mode: payload.mode,
+    session_type: 'unattended',
   })
   return `hi5central-viewer://connect?${query.toString()}`
 }
@@ -223,6 +279,10 @@ export function registerRmmRemoteRoutes(app) {
     })
 
     const viewerClient = viewerClientForRequest(c, body.viewerClient)
+    const viewerPlatform = viewerClient === 'native' ? viewerPlatformForRequest(c, body.viewerPlatform) : 'browser'
+    const viewerRelease = viewerClient === 'native'
+      ? await viewerReleaseForPlatform(viewerPlatform)
+      : { version: '', url: null }
     const sessionId = randomUUID()
     const token = randomSecret('h5v')
     const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000)
@@ -240,15 +300,18 @@ export function registerRmmRemoteRoutes(app) {
       token,
       wssUrl: VIEWER_WS_URL,
       mode,
+      sessionType: 'unattended',
       iceServers: ice.viewer,
     }
     return c.json({
       session: { id: sessionId, mode, expiresAt: expiresAt.toISOString(), deviceName: agent.name, reference: agent.reference },
       connection,
       viewerClient,
+      viewerPlatform,
+      viewerRequiredVersion: viewerRelease.version || null,
       browserUrl: viewerClient === 'browser' ? browserLaunchUrl(auth.session.slug, connection) : null,
       nativeUrl: viewerClient === 'native' ? nativeLaunchUrl(connection) : null,
-      viewerDownloadUrl: viewerClient === 'native' ? VIEWER_DOWNLOAD_URL : null,
+      viewerDownloadUrl: viewerClient === 'native' ? viewerRelease.url : null,
     }, 201)
   })
 
@@ -333,7 +396,13 @@ export function registerRmmRemoteRoutes(app) {
     const remote = result.rows[0]
     const modeError = ensureSessionModeAccess(c, auth.session, remote.mode)
     if (modeError) return modeError
-    return c.json({ session: remote })
+    const active = activeViewerSessions.get(String(remote.id))
+    return c.json({
+      session: {
+        ...remote,
+        viewerVersion: clean(active?.viewerVersion) || null,
+      },
+    })
   })
 }
 
@@ -364,6 +433,9 @@ export function attachRmmViewerWebSocket(server) {
       url.searchParams.get('device_id'),
       url.searchParams.get('token'),
     ).catch(() => null)
+    if (viewerSession) {
+      viewerSession.viewer_version = clean(url.searchParams.get('viewer_version'))
+    }
     if (viewerSession?.viewer_client === 'browser') {
       const requestedClient = clean(url.searchParams.get('client')).toLowerCase()
       // The session itself already authorises the browser Viewer. Do not
@@ -420,7 +492,7 @@ export function attachRmmViewerWebSocket(server) {
       viewerWs, agentWs: null, tenantId: remote.tenant_id, agentDeviceId: String(remote.agent_device_id),
       cleanupTimer: null, agentRestartTimer: null, relayFromAgent: null,
       mode: remote.mode, technicianName: clean(remote.technician_name || remote.technician_email) || 'Hi5Central technician',
-      iceAgent: ice.agent, finalized: false, onAgentConnected: null, onAgentDisconnected: null, finalize: null,
+      iceAgent: ice.agent, viewerVersion: clean(remote.viewer_version), finalized: false, onAgentConnected: null, onAgentDisconnected: null, finalize: null,
       agentDisconnectedAt: 0,
     }
     activeViewerSessions.set(sessionId, active)
@@ -499,8 +571,13 @@ export function attachRmmViewerWebSocket(server) {
       nextAgentWs.on('message', relayFromAgent)
       if (restarted) safeSend(active.viewerWs, { type: 'agent_reconnected', session_id: sessionId })
       const sent = safeSend(nextAgentWs, {
-        type: 'start_webrtc', session_id: sessionId, mode: remote.mode,
-        technician_name: active.technicianName, iceServers: active.iceAgent,
+        type: 'start_webrtc',
+        session_id: sessionId,
+        mode: remote.mode,
+        session_type: 'unattended',
+        technician_name: active.technicianName,
+        chat_available: remote.mode === 'console',
+        iceServers: active.iceAgent,
       })
       if (sent) safeSend(active.viewerWs, { type: 'start_webrtc_sent', session_id: sessionId, restarted })
       return sent
