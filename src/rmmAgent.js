@@ -1543,26 +1543,39 @@ export function registerRmmAgentRoutes(app) {
     const pkg = result.rows[0]
     if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
     if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
-    if (pkg.installer_platform !== 'windows' || !['exe', 'msi'].includes(pkg.installer_format)) {
-      return c.json({ error: 'This installer record is not a supported Windows installer.' }, 409)
-    }
-
     let installer
+    let contentType
+    let downloadName
     try {
-      installer = windowsTenantInstallerBuffer(packageId, pkg.installer_format)
+      if (pkg.installer_platform === 'windows' && ['exe', 'msi'].includes(pkg.installer_format)) {
+        installer = windowsTenantInstallerBuffer(packageId, pkg.installer_format)
+        contentType = pkg.installer_format === 'msi'
+          ? 'application/x-msi'
+          : 'application/vnd.microsoft.portable-executable'
+        downloadName = pkg.installer_format === 'msi'
+          ? 'Hi5CentralAgent.msi'
+          : 'Hi5CentralAgent.exe'
+      } else if (pkg.installer_platform === 'linux' && ['deb', 'rpm'].includes(pkg.installer_format)) {
+        installer = await linuxTenantInstallerPackage(pkg)
+        contentType = pkg.installer_format === 'deb'
+          ? 'application/vnd.debian.binary-package'
+          : 'application/x-rpm'
+        downloadName = pkg.installer_format === 'deb'
+          ? 'hi5centralagent.deb'
+          : 'hi5centralagent.rpm'
+      } else {
+        return c.json({ error: 'This installer record is not a supported single-file installer.' }, 409)
+      }
     } catch (error) {
-      return c.json({ error: clean(error?.message || error) || 'Windows installer is unavailable.' }, 503)
+      return c.json({ error: clean(error?.message || error) || 'Agent installer is unavailable.' }, 503)
     }
 
-    const isMsi = pkg.installer_format === 'msi'
     return new Response(installer, {
       status: 200,
       headers: {
-        'Content-Type': isMsi ? 'application/x-msi' : 'application/vnd.microsoft.portable-executable',
+        'Content-Type': contentType,
         'Content-Length': String(installer.length),
-        'Content-Disposition': isMsi
-          ? 'attachment; filename="Hi5CentralAgent.msi"'
-          : 'attachment; filename="Hi5CentralAgent.exe"',
+        'Content-Disposition': 'attachment; filename="' + downloadName + '"',
         'Cache-Control': 'private, no-store',
       },
     })
