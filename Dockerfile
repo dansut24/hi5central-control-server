@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY package.json ./
 RUN npm install --omit=dev \
-    && apk add --no-cache dpkg rpm tar
+    && apk add --no-cache binutils dpkg file findutils rpm tar
 
 COPY migrations ./migrations
 COPY src ./src
