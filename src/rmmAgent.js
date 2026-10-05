@@ -3,7 +3,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSyn
 import path from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { gunzipSync } from 'node:zlib'
+import { gzipSync, gunzipSync } from 'node:zlib'
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { WebSocketServer } from 'ws'
 import { hasPermission } from './access.js'
@@ -145,6 +145,7 @@ function linuxTenantInstallerInstallCommand(formatValue = '') {
       : format === 'rpm'
         ? 'hi5central-agent-deployment_x86_64.rpm'
         : ''
+  const bundleName = linuxTenantInstallerBundleName(format)
   const installCommand = format === 'run'
     ? 'if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl tar; elif command -v yum >/dev/null 2>&1; then yum install -y curl tar; else echo "curl and tar are required before installing the Hi5Central Agent."; exit 1; fi; fi && chmod 0755 "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" && "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" --config "$HI5_DIR/Hi5CentralDeployment.json"'
     : format === 'deb'
@@ -152,13 +153,18 @@ function linuxTenantInstallerInstallCommand(formatValue = '') {
       : format === 'rpm'
         ? 'install -d -m 700 /etc/hi5central && install -m 600 "$HI5_DIR/Hi5CentralDeployment.json" /etc/hi5central/deployment.json && if command -v dnf >/dev/null 2>&1; then dnf install -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; elif command -v yum >/dev/null 2>&1; then yum localinstall -y "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; else rpm -U "$HI5_DIR/hi5central-agent-deployment_x86_64.rpm"; fi'
         : ''
-  if (!fileName || !installCommand) return ''
+  if (!fileName || !bundleName || !installCommand) return ''
   return [
     'HI5_DIR="$PWD"',
-    `if [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/${fileName}" ]; then HI5_DOWNLOADS="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DOWNLOAD 2>/dev/null || true)"; [ -n "$HI5_DOWNLOADS" ] || HI5_DOWNLOADS="$HOME/Downloads"; HI5_DIR="$HI5_DOWNLOADS"; fi`,
-    `[ -f "$HI5_DIR/Hi5CentralDeployment.json" ] && [ -f "$HI5_DIR/${fileName}" ] || { echo "Hi5Central installer files were not found in the current folder or Downloads."; exit 1; }`,
-    `HI5_INSTALL='${installCommand}'`,
-    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\\\"$HI5_DIR\\\" /bin/sh -c \'$HI5_INSTALL\'"; fi',
+    'HI5_EXTRACT=""',
+    'HI5_BUNDLE="$HI5_DIR/' + bundleName + '"',
+    'if { [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/' + fileName + '" ]; } && [ ! -f "$HI5_BUNDLE" ]; then HI5_DOWNLOADS="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DOWNLOAD 2>/dev/null || true)"; [ -n "$HI5_DOWNLOADS" ] || HI5_DOWNLOADS="$HOME/Downloads"; HI5_DIR="$HI5_DOWNLOADS"; HI5_BUNDLE="$HI5_DIR/' + bundleName + '"; fi',
+    'if { [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/' + fileName + '" ]; } && [ -f "$HI5_BUNDLE" ]; then command -v tar >/dev/null 2>&1 || { echo "tar is required to unpack the Hi5Central deployment bundle."; exit 1; }; HI5_EXTRACT="$(mktemp -d /tmp/hi5central-deploy.XXXXXX)" || exit 1; tar -xzf "$HI5_BUNDLE" -C "$HI5_EXTRACT" || { rm -rf "$HI5_EXTRACT"; exit 1; }; HI5_DIR="$HI5_EXTRACT"; fi',
+    '[ -f "$HI5_DIR/Hi5CentralDeployment.json" ] && [ -f "$HI5_DIR/' + fileName + '" ] || { echo "Hi5Central deployment bundle or installer files were not found in the current folder or Downloads."; [ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"; exit 1; }',
+    'HI5_INSTALL=' + JSON.stringify(installCommand),
+    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\\\"$HI5_DIR\\\" /bin/sh -c \'$HI5_INSTALL\'"; HI5_STATUS=$?; fi',
+    '[ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"',
+    'exit "$HI5_STATUS"',
   ].join('; ')
 }
 
@@ -237,6 +243,90 @@ function tenantInstallerUrl(packageId, formatValue = '') {
   }
   return TENANT_INSTALLER_GENERIC_URLS[format] || null
 }
+function tenantInstallerBundleUrl(packageId, platformValue = '', formatValue = '') {
+  const platform = clean(platformValue).toLowerCase()
+  const format = clean(formatValue).toLowerCase()
+  if (platform !== 'linux' || !['run', 'deb', 'rpm'].includes(format)) return null
+  return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/bundle'
+}
+
+function linuxTenantInstallerBundleName(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (!['run', 'deb', 'rpm'].includes(format)) return ''
+  return 'Hi5CentralAgentDeployment-Linux-' + format.toUpperCase() + '.tar.gz'
+}
+
+function tarOctal(value, length) {
+  const text = Math.max(0, Number(value) || 0).toString(8).padStart(length - 1, '0')
+  return text.slice(-(length - 1)) + '\0'
+}
+
+function tarEntry(name, content, mode = 0o644) {
+  const body = Buffer.isBuffer(content) ? content : Buffer.from(content)
+  const header = Buffer.alloc(512, 0)
+  Buffer.from(name, 'utf8').copy(header, 0, 0, 100)
+  Buffer.from(tarOctal(mode, 8), 'ascii').copy(header, 100)
+  Buffer.from(tarOctal(0, 8), 'ascii').copy(header, 108)
+  Buffer.from(tarOctal(0, 8), 'ascii').copy(header, 116)
+  Buffer.from(tarOctal(body.length, 12), 'ascii').copy(header, 124)
+  Buffer.from(tarOctal(Math.floor(Date.now() / 1000), 12), 'ascii').copy(header, 136)
+  header.fill(0x20, 148, 156)
+  header[156] = 0x30
+  Buffer.from('ustar\0', 'ascii').copy(header, 257)
+  Buffer.from('00', 'ascii').copy(header, 263)
+  Buffer.from('root', 'ascii').copy(header, 265)
+  Buffer.from('root', 'ascii').copy(header, 297)
+  let checksum = 0
+  for (const byte of header) checksum += byte
+  Buffer.from(checksum.toString(8).padStart(6, '0') + '\0 ', 'ascii').copy(header, 148)
+  const padding = Buffer.alloc((512 - (body.length % 512)) % 512, 0)
+  return Buffer.concat([header, body, padding])
+}
+
+function tarGzip(entries) {
+  const tar = Buffer.concat([
+    ...entries.map((entry) => tarEntry(entry.name, entry.content, entry.mode)),
+    Buffer.alloc(1024, 0),
+  ])
+  return gzipSync(tar, { level: 9 })
+}
+
+function tenantInstallerDeploymentConfig(pkg) {
+  return {
+    schemaVersion: 1,
+    apiBase: TENANT_INSTALLER_API_BASE,
+    deploymentId: pkg.id,
+    deploymentSecret: tenantInstallerDeploymentSecret(pkg.id),
+    installerPlatform: pkg.installer_platform,
+    installerFormat: pkg.installer_format,
+  }
+}
+
+async function linuxTenantInstallerBundle(pkg) {
+  const format = clean(pkg?.installer_format).toLowerCase()
+  const installerUrl = TENANT_INSTALLER_GENERIC_URLS[format]
+  const definition = TENANT_INSTALLER_ASSETS[format]
+  if (clean(pkg?.installer_platform).toLowerCase() !== 'linux' || !installerUrl || !definition) {
+    throw new Error('This deployment is not a supported Linux installer.')
+  }
+  const response = await fetch(installerUrl, { signal: AbortSignal.timeout(30_000) })
+  if (!response.ok) throw new Error('Linux installer download failed HTTP ' + response.status + '.')
+  const installer = Buffer.from(await response.arrayBuffer())
+  if (!installer.length || installer.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+    throw new Error('Linux installer has an invalid size.')
+  }
+  const config = Buffer.from(JSON.stringify(tenantInstallerDeploymentConfig(pkg), null, 2) + '\n', 'utf8')
+  const installerName = format === 'run'
+    ? 'Hi5CentralAgentDeployment-Linux.run'
+    : format === 'deb'
+      ? 'hi5central-agent-deployment_amd64.deb'
+      : 'hi5central-agent-deployment_x86_64.rpm'
+  return tarGzip([
+    { name: installerName, content: installer, mode: format === 'run' ? 0o755 : 0o644 },
+    { name: 'Hi5CentralDeployment.json', content: config, mode: 0o600 },
+  ])
+}
+
 
 function tenantInstallerHmacKey() {
   return clean(process.env.TENANT_INSTALLER_HMAC_KEY || process.env.CONNECT_CODE_HMAC_KEY)
@@ -1099,7 +1189,10 @@ export function registerRmmAgentRoutes(app) {
     const packages = (await packageRows(auth.session.tenant_id)).map((pkg) => ({
       ...pkg,
       installer_url: pkg.persistent && pkg.installer_format
-        ? tenantInstallerUrl(pkg.id, pkg.installer_format)
+        ? (tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format))
+        : null,
+      bundle_url: pkg.persistent
+        ? tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format)
         : null,
       deployment_config_url: pkg.persistent && !['exe', 'msi'].includes(pkg.installer_format)
         ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
@@ -1171,9 +1264,12 @@ export function registerRmmAgentRoutes(app) {
       installer: persistent ? {
         platform: pkg.installer_platform,
         format: pkg.installer_format,
-        url: tenantInstallerUrl(pkg.id, pkg.installer_format),
+        url: tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format),
+        bundleUrl: tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format),
       } : null,
-      downloadUrl: persistent ? tenantInstallerUrl(pkg.id, pkg.installer_format) : AGENT_DOWNLOAD_URL,
+      downloadUrl: persistent
+        ? (tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format))
+        : AGENT_DOWNLOAD_URL,
       installCommand,
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
@@ -1220,6 +1316,44 @@ export function registerRmmAgentRoutes(app) {
         'Content-Disposition': isMsi
           ? 'attachment; filename="Hi5CentralAgent.msi"'
           : 'attachment; filename="Hi5CentralAgent.exe"',
+        'Cache-Control': 'private, no-store',
+      },
+    })
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/bundle', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    if (pkg.installer_platform !== 'linux' || !['run', 'deb', 'rpm'].includes(pkg.installer_format)) {
+      return c.json({ error: 'This deployment does not use a Linux installer bundle.' }, 409)
+    }
+
+    let bundle
+    try {
+      bundle = await linuxTenantInstallerBundle(pkg)
+    } catch (error) {
+      return c.json({ error: clean(error?.message || error) || 'Linux deployment bundle is unavailable.' }, 503)
+    }
+    const fileName = linuxTenantInstallerBundleName(pkg.installer_format)
+    return new Response(bundle, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/gzip',
+        'Content-Length': String(bundle.length),
+        'Content-Disposition': 'attachment; filename="' + fileName + '"',
         'Cache-Control': 'private, no-store',
       },
     })
