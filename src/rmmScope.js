@@ -61,7 +61,7 @@ async function scopeDeviceRows(tenantId) {
     "       d.user_display_name,d.user_principal_name,d.category_name,d.compliance_state,d.is_encrypted,d.source,d.source_payload,",
     "       p.name AS assigned_person_name,p.email AS assigned_person_email,",
     "       os.external_key AS site_id,os.name AS site_name,",
-    "       CASE WHEN COALESCE(self_agent.websocket_status,agent_match.websocket_status)='Connected'",
+    "       CASE WHEN COALESCE(self_agent.websocket_status,agent_match.websocket_status) IN ('Connected','TelemetryOnly')",
     "             AND COALESCE(self_agent.last_telemetry_at,agent_match.last_telemetry_at)>now()-interval '90 seconds'",
     "            THEN true ELSE false END AS agent_online,",
     "       CASE WHEN d.source='hi5central_agent' THEN d.source_payload ELSE agent_match.agent_payload END AS agent_payload",
