@@ -1597,8 +1597,8 @@ export function registerRmmAgentRoutes(app) {
     const pkg = result.rows[0]
     if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
     if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
-    if (pkg.installer_platform !== 'linux' || !['run', 'deb', 'rpm'].includes(pkg.installer_format)) {
-      return c.json({ error: 'This deployment does not use a Linux installer bundle.' }, 409)
+    if (pkg.installer_platform !== 'linux' || pkg.installer_format !== 'run') {
+      return c.json({ error: 'Only the legacy RUN installer uses a Linux deployment bundle.' }, 409)
     }
 
     let bundle
@@ -1635,8 +1635,8 @@ export function registerRmmAgentRoutes(app) {
     const pkg = result.rows[0]
     if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
     if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
-    if (pkg.installer_format === 'exe') {
-      return c.json({ error: 'Windows EXE deployment credentials are embedded server-side in Hi5CentralAgent.exe.' }, 409)
+    if (['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)) {
+      return c.json({ error: 'This installer already contains its deployment configuration.' }, 409)
     }
 
     c.header('Content-Disposition', 'attachment; filename="Hi5CentralDeployment.json"')
