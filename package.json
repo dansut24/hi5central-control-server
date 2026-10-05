@@ -4,9 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "build:runtime": "mkdir -p dist && esbuild src/index.js --bundle --platform=node --format=esm --packages=external --minify --legal-comments=none --outfile=dist/index.mjs && esbuild src/migrate.js --bundle --platform=node --format=esm --packages=external --minify --legal-comments=none --outfile=dist/migrate.mjs",
     "migrate": "node src/migrate.js",
+    "migrate:dist": "node dist/migrate.mjs",
     "reset:service-requests": "node scripts/reset-service-request-defaults.mjs",
     "start": "node src/index.js",
+    "start:dist": "node dist/index.mjs",
+    "test:licensing": "node scripts/test-license-envelope.mjs",
+    "test:release-feed": "node scripts/test-release-feed.mjs",
     "check:vendor-html": "node scripts/check-vendor-html.mjs"
   },
   "dependencies": {
@@ -15,9 +20,12 @@
     "fast-xml-parser": "^5.11.1",
     "hono": "4.13.7",
     "jose": "^6.2.12",
-    "nodemailer": "9.1.1",
+    "nodemailer": "^10.0.13",
     "pg": "8.23.0",
     "redis": "6.2.1",
     "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10"
   }
 }

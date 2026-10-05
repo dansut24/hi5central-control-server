@@ -42,7 +42,12 @@ function escapeRegex(value = '') {
 
 export const deployment = Object.freeze((() => {
   const deploymentMode = enumValue(process.env.DEPLOYMENT_MODE, ['managed', 'self_hosted'], 'managed')
+  const selfHostEdition = deploymentMode === 'self_hosted'
+    ? enumValue(process.env.SELF_HOST_EDITION, ['standard', 'msp'], 'standard')
+    : 'managed'
   const tenancyMode = enumValue(process.env.TENANCY_MODE, ['multi', 'single'], 'multi')
+  const runtimeEnvironment = enumValue(process.env.RUNTIME_ENVIRONMENT, ['dev', 'test', 'uat', 'live'], 'live')
+  const featureMode = enumValue(process.env.FEATURE_MODE, ['all_enabled', 'controlled'], runtimeEnvironment === 'dev' || runtimeEnvironment === 'test' ? 'all_enabled' : 'controlled')
   const rootDomain = cleanDomain(process.env.ROOT_DOMAIN, 'hi5central.com')
   const primaryTenantSlug = cleanSlug(process.env.PRIMARY_TENANT_SLUG)
   const defaultAppUrl = tenancyMode === 'single' ? `https://${rootDomain}` : ''
@@ -54,11 +59,16 @@ export const deployment = Object.freeze((() => {
   const apiUrl = cleanUrl(process.env.API_URL, tenancyMode === 'single' ? appUrl : `https://api.${rootDomain}`)
   const portalUrl = cleanUrl(process.env.PORTAL_URL, tenancyMode === 'single' ? `${appUrl}/portal` : '')
   const rmmUrl = cleanUrl(process.env.RMM_URL, tenancyMode === 'single' ? `${appUrl}/rmm` : '')
-  const adminUrl = cleanUrl(process.env.ADMIN_URL, `https://admin.${rootDomain}`)
+  const adminUrl = deploymentMode === 'self_hosted' && selfHostEdition === 'standard'
+    ? ''
+    : cleanUrl(process.env.ADMIN_URL, `https://admin.${rootDomain}`)
 
   return {
     deploymentMode,
+    selfHostEdition,
     tenancyMode,
+    runtimeEnvironment,
+    featureMode,
     rootDomain,
     primaryTenantSlug,
     appUrl,

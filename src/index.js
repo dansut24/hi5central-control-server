@@ -5,9 +5,13 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { secureHeaders } from 'hono/secure-headers'
 import { attachAccess, effectiveAccessForUser } from './access.js'
+import { registerApiTokenRoutes } from './apiTokens.js'
 import { enforceWorkspacePermissions } from './accessGate.js'
 import { registerCatalogueRoutes } from './catalogue.js'
-import { registerLicensingRoutes } from './licensing.js'
+import { featureEntitled, registerLicensingRoutes, startLicensingRefreshScheduler } from './licensing.js'
+import { registerFeatureFlagRoutes } from './featureFlags.js'
+import { registerTenantReleaseRoutes } from './tenantRelease.js'
+import { registerLicenseAuthorityRoutes } from './licenseAuthority.js'
 import { registerMicrosoftRoutes, startMicrosoftSyncScheduler } from './microsoftIntegration.js'
 import { attachRmmAgentWebSocket, initializeAgentBroker, registerRmmAgentRoutes, shutdownAgentBroker } from './rmmAgent.js'
 import { registerRmmAutomationRoutes } from './rmmAutomation.js'
@@ -33,7 +37,10 @@ import {
 import { pool, withTransaction } from './db.js'
 import { sendVerificationEmail, verifySmtpConnection } from './mailer.js'
 import { registerOrganisationRoutes } from './organisation.js'
+import { buildOpenApiDocument } from './openapi.js'
 import { registerPlatformAdminRoutes } from './platformAdmin.js'
+import { registerReleaseOperatorRoutes } from './releaseOperator.js'
+import { registerReleaseFeedRoutes, startReleaseFeedScheduler } from './releaseFeed.js'
 import { registerProjectRoutes } from './projects.js'
 import { verifyPassword } from './password.js'
 import { ensureRedisConnected, redis } from './redis.js'
@@ -157,6 +164,24 @@ app.get('/api/v1/system/smtp-health', async (c) => {
   }
 })
 
+app.get('/api/v1/system/capabilities', (c) => c.json({
+  api: { framework: 'Hono', version: 'v1', apiFirst: true },
+  authentication: {
+    browser: 'session_cookie',
+    integrations: 'bearer_api_token',
+    apiTokenEndpoint: '/api/v1/integrations/api-tokens',
+  },
+  documentation: {
+    openapi: '/api/v1/openapi.json',
+    routes: '/api/v1/system/routes',
+  },
+  deployment: {
+    mode: deployment.deploymentMode,
+    edition: deployment.selfHostEdition,
+    tenancy: deployment.tenancyMode,
+  },
+}))
+
 app.get('/api/v1/auth/tenant-slug/:slug', async (c) => {
   const slug = normaliseSlug(c.req.param('slug'))
   if (!validSlug(slug)) return c.json({ slug, available: false, reason: 'invalid' }, 200)
@@ -251,7 +276,8 @@ app.post('/api/v1/auth/signup', async (c) => {
   const verificationToken = randomBytes(32).toString('base64url')
   const verificationTokenHash = hashToken(verificationToken)
   const generatedUrls = tenantUrls(tenantSlug, { rmm: modules.includes('rmm') })
-  const { tenantUrl, portalUrl, rmmUrl } = generatedUrls
+  const { tenantUrl, rmmUrl } = generatedUrls
+  const portalUrl = modules.includes('itsm') ? generatedUrls.portalUrl : null
 
   try {
     const result = await withTransaction(async (client) => {
@@ -263,7 +289,7 @@ app.post('/api/v1/auth/signup', async (c) => {
       await client.query(
         `INSERT INTO tenant_settings (tenant_id,modules,onboarding_step,tenant_url,portal_url,rmm_url)
          VALUES ($1,$2::jsonb,'verify_email',$3,$4,$5)`,
-        [tenant.id, JSON.stringify({ itsm: modules.includes('itsm'), rmm: modules.includes('rmm') }), tenantUrl, portalUrl, rmmUrl],
+        [tenant.id, JSON.stringify({ itsm: modules.includes('itsm'), selfService: modules.includes('itsm'), rmm: modules.includes('rmm') }), tenantUrl, portalUrl, rmmUrl],
       )
       await client.query(
         `INSERT INTO user_email_verifications (tenant_id,user_id,token_hash,redirect_url,expires_at)
@@ -393,8 +419,26 @@ app.post('/api/v1/onboarding/complete', async (c) => {
   return c.json(sessionPayload(refreshed))
 })
 
+app.use('/api/platform/v1/*', async (c, next) => {
+  if (deployment.deploymentMode === 'managed') return next()
+  if (deployment.selfHostEdition === 'standard') {
+    if (deployment.runtimeEnvironment === 'live' && c.req.path.startsWith('/api/platform/v1/releases')) return next()
+    return c.json({ error: 'Platform Admin is not included in the Standard self-host edition.', code: 'FEATURE_NOT_AVAILABLE' }, 404)
+  }
+  if (!await featureEntitled('platformAdmin')) {
+    return c.json({ error: 'A valid Hi5Central MSP licence is required.', code: 'FEATURE_NOT_ENTITLED' }, 403)
+  }
+  return next()
+})
+
 registerPlatformAdminRoutes(app)
+registerReleaseOperatorRoutes(app)
+registerReleaseFeedRoutes(app)
+registerLicenseAuthorityRoutes(app)
 registerLicensingRoutes(app)
+registerFeatureFlagRoutes(app)
+registerTenantReleaseRoutes(app)
+registerApiTokenRoutes(app)
 registerCatalogueRoutes(app)
 registerOrganisationRoutes(app)
 registerSettingsRoutes(app)
@@ -412,6 +456,8 @@ registerRmmAppPortalRoutes(app)
 registerRmmNetworkDiscoveryRoutes(app)
 registerRmmRecoveryKeyRoutes(app)
 
+app.get('/api/v1/openapi.json', (c) => c.json(buildOpenApiDocument(app, deployment)))
+
 app.notFound((c) => c.json({ error: 'Not found' }, 404))
 app.onError((error, c) => {
   console.error('Unhandled API error', error)
@@ -422,6 +468,8 @@ app.onError((error, c) => {
 await pool.query('SELECT 1')
 await ensureRedisConnected()
 await initializeAgentBroker()
+startLicensingRefreshScheduler()
+startReleaseFeedScheduler()
 if (backgroundWorkersEnabled) {
   startMicrosoftSyncScheduler()
   startRmmVulnerabilitySyncScheduler()

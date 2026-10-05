@@ -21,6 +21,7 @@ function normaliseEmail(value = '') { return String(value).trim().toLowerCase() 
 function normaliseSlug(value = '') { return String(value).trim().toLowerCase() }
 function validSlug(slug) { return /^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$/.test(slug) && !slug.includes('--') }
 function validEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254 }
+function selfServiceEnabled(modules = {}) { return Boolean(modules?.itsm && modules?.selfService !== false) }
 function hashToken(value) { return createHash('sha256').update(String(value || '')).digest('hex') }
 
 function portalOrigin(c, slug) {
@@ -55,7 +56,7 @@ async function portalAccount(tenantSlug, email) {
 async function requesterPerson(tenantSlug, email) {
   const result = await pool.query(
     `SELECT t.id AS tenant_id,t.slug,t.company_name,t.status AS tenant_status,
-            ts.portal_url,ts.onboarding_completed_at,ts.configuration,ts.onboarding_data,
+            ts.portal_url,ts.modules,ts.onboarding_completed_at,ts.configuration,ts.onboarding_data,
             p.id AS person_id,p.external_key,p.user_id,p.name,p.email,p.active,p.access_profile
      FROM tenants t
      JOIN tenant_settings ts ON ts.tenant_id=t.id
@@ -77,6 +78,7 @@ async function requirePortalSession(c) {
   if (!session) return { error: c.json({ error: 'Authentication required.' }, 401) }
   if (!portalOrigin(c, session.slug)) return { error: c.json({ error: 'Portal session mismatch.' }, 403) }
   if (!session.onboarding_completed_at) return { error: c.json({ error: 'This tenant has not completed setup.' }, 403) }
+  if (!selfServiceEnabled(session.modules)) return { error: c.json({ error: 'Self Service is not enabled for this tenant.' }, 403) }
   const capabilities = await portalApprovalCapabilities(session)
   if (!capabilities.requests && !capabilities.approvals) return { error: c.json({ error: 'Requester Portal or approval access is required.' }, 403) }
   return { session, capabilities }
@@ -108,6 +110,7 @@ export function registerPortalAuthRoutes(app) {
     if (!account || account.tenant_status !== 'active' || account.membership_status !== 'active' || !account.onboarding_completed_at) {
       return c.json({ error: 'Email address or password is incorrect.' }, 401)
     }
+    if (!selfServiceEnabled(account.modules)) return c.json({ error: 'Self Service is not enabled for this tenant.' }, 403)
     if (!await verifyPassword(password, account.password_hash)) {
       await recordSecurityEvent({ tenantId: account.tenant_id, actorUserId: account.user_id, eventType: 'portal.login', outcome: 'failure', ipAddress: requestIp(c), userAgent: requestUserAgent(c) })
       return c.json({ error: 'Email address or password is incorrect.' }, 401)
@@ -169,7 +172,7 @@ export function registerPortalAuthRoutes(app) {
     const allowed = await rateLimit(`portal-activate:${requestIp(c)}:${tenantSlug}:${email}`, 5, 900)
     if (!allowed) return c.json(generic)
     const person = await requesterPerson(tenantSlug, email)
-    if (!person || person.tenant_status !== 'active' || !person.onboarding_completed_at || !person.portal_url) return c.json(generic)
+    if (!person || person.tenant_status !== 'active' || !person.onboarding_completed_at || !person.portal_url || !selfServiceEnabled(person.modules)) return c.json(generic)
 
     if (person.user_id) {
       const linked = await pool.query('SELECT role,status FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2 LIMIT 1', [person.tenant_id, person.user_id])
@@ -208,7 +211,7 @@ export function registerPortalAuthRoutes(app) {
         const tokenResult = await client.query(
           `SELECT pat.id AS token_id,pat.tenant_id,pat.person_id,pat.email,
                   t.slug,t.company_name,t.status AS tenant_status,
-                  ts.onboarding_completed_at,ts.configuration,ts.onboarding_data,
+                  ts.modules,ts.onboarding_completed_at,ts.configuration,ts.onboarding_data,
                   p.name,p.user_id
            FROM portal_access_tokens pat
            JOIN tenants t ON t.id=pat.tenant_id
@@ -220,7 +223,7 @@ export function registerPortalAuthRoutes(app) {
         )
         if (!tokenResult.rowCount) { const error = new Error('This activation link is invalid or has expired.'); error.status = 400; throw error }
         const activation = tokenResult.rows[0]
-        if (activation.tenant_status !== 'active' || !activation.onboarding_completed_at) { const error = new Error('This Help Centre is not available yet.'); error.status = 409; throw error }
+        if (activation.tenant_status !== 'active' || !activation.onboarding_completed_at || !selfServiceEnabled(activation.modules)) { const error = new Error('This Help Centre is not available yet.'); error.status = 409; throw error }
 
         const policy = securitySettings(activation).passwordPolicy
         const passwordCheck = passwordPolicyResult(password, policy)

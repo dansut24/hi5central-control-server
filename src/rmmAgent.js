@@ -140,8 +140,30 @@ function tenantInstallerSelection(platformValue = '', formatValue = '') {
 
 function linuxTenantInstallerInstallCommand(formatValue = '') {
   const format = clean(formatValue).toLowerCase()
-  if (format === 'deb') return 'sudo dpkg -i ./hi5centralagent.deb'
-  if (format === 'rpm') return 'sudo rpm -Uvh ./hi5centralagent.rpm'
+  const packageName = format === 'deb'
+    ? 'hi5centralagent.deb'
+    : format === 'rpm'
+      ? 'hi5centralagent.rpm'
+      : ''
+  const rootInstall = format === 'deb'
+    ? 'dpkg -i "$HI5_PKG"'
+    : format === 'rpm'
+      ? 'rpm -Uvh "$HI5_PKG"'
+      : ''
+
+  if (packageName && rootInstall) {
+    return '(' + [
+      'HI5_PKG="$PWD/' + packageName + '"',
+      '[ -f "$HI5_PKG" ] || { echo "Installer not found: $HI5_PKG"; exit 1; }',
+      'HI5_INSTALL=' + JSON.stringify(rootInstall),
+      'if [ "$(id -u)" -eq 0 ]; then /bin/sh -c "$HI5_INSTALL"',
+      'elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\n" | grep -Eq "^(sudo|wheel)$"; then sudo /bin/sh -c "$HI5_INSTALL"',
+      'elif command -v pkexec >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then pkexec /usr/bin/env HI5_PKG="$HI5_PKG" /bin/sh -c "$HI5_INSTALL" || { echo "Graphical elevation failed; enter the root password instead."; su -c "HI5_PKG=\\\"$HI5_PKG\\\" /bin/sh -c \\\"$HI5_INSTALL\\\""; }',
+      'else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_PKG=\\\"$HI5_PKG\\\" /bin/sh -c \\\"$HI5_INSTALL\\\""',
+      'fi',
+    ].join('; ') + ')'
+  }
+
   if (format !== 'run') return ''
 
   const fileName = 'Hi5CentralAgentDeployment-Linux.run'

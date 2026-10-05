@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws'
 import { hasPermission } from './access.js'
 import { deployment, originMatchesTenant, tenantUrls } from './deploymentConfig.js'
 import { pool } from './db.js'
-import { agentSocketForDevice, subscribeAgentConnections } from './rmmAgent.js'
+import { agentSocketForDevice, sendAgentMessage, subscribeAgentConnections, subscribeAgentMessages } from './rmmAgent.js'
 import { recordRmmActivity } from './rmmActivity.js'
 import { resolveSession } from './session.js'
 
@@ -20,6 +20,8 @@ const TURN_SHARED_SECRET_FILE = process.env.TURN_SHARED_SECRET_FILE || '/run/sec
 const SESSION_TTL_SECONDS = 15 * 60
 const ACTIVE_RECONNECT_TTL_SECONDS = 8 * 60 * 60
 const MAX_VIEWER_PAYLOAD_BYTES = 8 * 1024 * 1024
+const WAYLAND_PERSISTENCE_MIN_AGENT_VERSION = '0.3.151'
+const WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION = '0.3.153'
 const VIEWER_RECONNECT_GRACE_MS = 90 * 1000
 const AGENT_RESTART_GRACE_MS = 10 * 60 * 1000
 const activeViewerSessions = new Map()
@@ -39,7 +41,46 @@ const VIEWER_MESSAGE_TYPES = new Set([
 
 function clean(value = '') { return String(value ?? '').trim() }
 function sha256(value = '') { return createHash('sha256').update(String(value)).digest('hex') }
+function versionAtLeast(value, minimum) {
+  const current = clean(value).match(/\d+(?:\.\d+){1,3}/)?.[0]?.split('.').map(Number) || []
+  const target = clean(minimum).match(/\d+(?:\.\d+){1,3}/)?.[0]?.split('.').map(Number) || []
+  const length = Math.max(current.length, target.length)
+  for (let index = 0; index < length; index += 1) {
+    const left = current[index] || 0
+    const right = target[index] || 0
+    if (left !== right) return left > right
+  }
+  return target.length > 0
+}
 function randomSecret(prefix) { return `${prefix}_${randomBytes(32).toString('base64url')}` }
+
+function requestAgentReply(agentDeviceId, requestType, responseType, timeoutMs = 2500) {
+  const requestId = randomUUID()
+  return new Promise((resolve) => {
+    let settled = false
+    let timer = null
+    let unsubscribe = () => {}
+
+    const finish = (payload = null) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      try { unsubscribe() } catch {}
+      resolve(payload)
+    }
+
+    unsubscribe = subscribeAgentMessages(agentDeviceId, (payload) => {
+      if (clean(payload?.type) !== responseType) return
+      if (clean(payload?.request_id) !== requestId) return
+      finish(payload)
+    })
+
+    timer = setTimeout(() => finish(null), timeoutMs)
+    if (!sendAgentMessage(agentDeviceId, { type: requestType, request_id: requestId })) {
+      finish(null)
+    }
+  })
+}
 function isPortableUserAgent(value = '') {
   return /Android|iPhone|iPad|iPod|Mobile|Tablet|Kindle|Silk/i.test(String(value || ''))
 }
@@ -155,10 +196,38 @@ function ensureSessionModeAccess(c, session, mode) {
   return null
 }
 
+function remoteEndpointPlatform(agent = {}) {
+  const combined = [
+    clean(agent.platform),
+    clean(agent.operating_system),
+  ].join(' ').toLowerCase()
+  if (/linux|fedora|ubuntu|debian|rhel|centos|rocky|alma|opensuse|suse/.test(combined)) return 'linux'
+  if (/macos|mac os|darwin/.test(combined)) return 'macos'
+  if (/windows/.test(combined)) return 'windows'
+  return 'unknown'
+}
+
+function remoteDesktopInventory(agent = {}) {
+  const inventory = object(agent.source_payload)
+  const direct = object(inventory.remote_desktop)
+  if (Object.keys(direct).length) return direct
+  return object(object(object(inventory.agent).capabilities).remote_desktop_capabilities)
+}
+
+function endpointUsesWayland(agent = {}) {
+  if (remoteEndpointPlatform(agent) !== 'linux') return false
+  const remote = remoteDesktopInventory(agent)
+  const backend = clean(remote.backend).toLowerCase()
+  const sessionType = clean(remote.session_type).toLowerCase()
+  return backend.includes('wayland')
+    || sessionType.includes('wayland')
+    || object(remote.wayland).detected === true
+}
+
 async function agentForRemoteSession(tenantId, agentDeviceId) {
   const result = await pool.query(
-    `SELECT a.id,a.tenant_id,a.inventory_id,a.websocket_status,a.last_telemetry_at,
-            i.reference,i.name,i.serial_number
+    `SELECT a.id,a.tenant_id,a.inventory_id,a.websocket_status,a.last_telemetry_at,a.agent_version,
+            i.reference,i.name,i.serial_number,i.platform,i.operating_system,i.source_payload
        FROM rmm_agent_devices a
        JOIN rmm_device_inventory i ON i.id=a.inventory_id
       WHERE a.id::text=$1 AND a.tenant_id=$2 AND a.disabled_at IS NULL AND i.active=true
@@ -278,6 +347,31 @@ export function registerRmmRemoteRoutes(app) {
       liveAgentWs: liveSocket,
     })
 
+    const endpointPlatform = remoteEndpointPlatform(agent)
+    const waylandPersistenceRequested =
+      mode === 'console' &&
+      endpointPlatform === 'linux' &&
+      body.waylandPersistence === true
+    const waylandEndpoint = endpointUsesWayland(agent)
+    const waylandPersistenceSupported =
+      waylandEndpoint &&
+      versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)
+
+    if (waylandPersistenceRequested && !waylandEndpoint) {
+      return c.json({
+        error: 'Persistent Wayland access is only available while the endpoint is using a Wayland desktop session.',
+        reason: 'not_wayland_session',
+      }, 409)
+    }
+    if (waylandPersistenceRequested && !waylandPersistenceSupported) {
+      return c.json({
+        error: 'Persistent Wayland access requires Hi5Central Agent ' + WAYLAND_PERSISTENCE_MIN_AGENT_VERSION + ' or newer.',
+        requiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
+        currentAgentVersion: clean(agent.agent_version) || null,
+      }, 409)
+    }
+    const waylandPersistence = waylandPersistenceRequested && waylandPersistenceSupported
+
     const viewerClient = viewerClientForRequest(c, body.viewerClient)
     const viewerPlatform = viewerClient === 'native' ? viewerPlatformForRequest(c, body.viewerPlatform) : 'browser'
     const viewerRelease = viewerClient === 'native'
@@ -288,9 +382,9 @@ export function registerRmmRemoteRoutes(app) {
     const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000)
     await pool.query(
       `INSERT INTO rmm_remote_sessions
-         (id,tenant_id,agent_device_id,inventory_id,created_by_user_id,mode,viewer_client,viewer_token_hash,status,expires_at,last_activity_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'created',$9,now())`,
-      [sessionId, auth.session.tenant_id, agent.id, agent.inventory_id, auth.session.user_id, mode, viewerClient, sha256(token), expiresAt],
+         (id,tenant_id,agent_device_id,inventory_id,created_by_user_id,mode,viewer_client,viewer_token_hash,wayland_persistence,status,expires_at,last_activity_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'created',$10,now())`,
+      [sessionId, auth.session.tenant_id, agent.id, agent.inventory_id, auth.session.user_id, mode, viewerClient, sha256(token), waylandPersistence, expiresAt],
     )
 
     const ice = iceConfiguration(sessionId)
@@ -304,7 +398,17 @@ export function registerRmmRemoteRoutes(app) {
       iceServers: ice.viewer,
     }
     return c.json({
-      session: { id: sessionId, mode, expiresAt: expiresAt.toISOString(), deviceName: agent.name, reference: agent.reference },
+      session: {
+        id: sessionId,
+        mode,
+        expiresAt: expiresAt.toISOString(),
+        deviceName: agent.name,
+        reference: agent.reference,
+        endpointPlatform,
+        waylandPersistence,
+        waylandPersistenceSupported,
+        waylandPersistenceRequiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
+      },
       connection,
       viewerClient,
       viewerPlatform,
@@ -315,11 +419,145 @@ export function registerRmmRemoteRoutes(app) {
     }, 201)
   })
 
+  app.get('/api/v1/rmm/devices/:agentDeviceId/wayland-persistence', async (c) => {
+    const auth = await requireRemoteAccess(c)
+    if (auth.error) return auth.error
+
+    const agent = await agentForRemoteSession(
+      auth.session.tenant_id,
+      clean(c.req.param('agentDeviceId')),
+    )
+    if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+
+    if (remoteEndpointPlatform(agent) !== 'linux') {
+      return c.json({
+        supported: false,
+        remembered: false,
+        state: 'unsupported',
+        reason: 'not_linux',
+      })
+    }
+    if (!endpointUsesWayland(agent)) {
+      return c.json({
+        supported: false,
+        remembered: false,
+        state: 'unsupported',
+        reason: 'not_wayland_session',
+      })
+    }
+
+    if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION)) {
+      return c.json({
+        supported: false,
+        remembered: null,
+        state: 'upgrade_required',
+        currentAgentVersion: clean(agent.agent_version) || null,
+        requiredAgentVersion: WAYLAND_PERSISTENCE_STATUS_MIN_AGENT_VERSION,
+      })
+    }
+
+    const reply = await requestAgentReply(
+      agent.id,
+      'get_wayland_persistence_status',
+      'wayland_persistence_status',
+    )
+    if (!reply) {
+      return c.json({
+        supported: true,
+        remembered: null,
+        state: 'unknown',
+        online: false,
+      })
+    }
+
+    return c.json({
+      supported: reply.supported === true,
+      remembered: reply.remembered === true,
+      state: clean(reply.status) || (reply.remembered === true ? 'remembered' : 'not_remembered'),
+      online: true,
+      activeUser: clean(reply.user) || null,
+      checkedAt: new Date().toISOString(),
+    })
+  })
+
+  app.post('/api/v1/rmm/devices/:agentDeviceId/wayland-persistence/forget', async (c) => {
+    const auth = await requireRemoteAccess(c)
+    if (auth.error) return auth.error
+
+    const agent = await agentForRemoteSession(
+      auth.session.tenant_id,
+      clean(c.req.param('agentDeviceId')),
+    )
+    if (!agent) return c.json({ error: 'Managed Agent not found for this device.' }, 404)
+    if (remoteEndpointPlatform(agent) !== 'linux') {
+      return c.json({ error: 'Remembered Wayland access is only available for Linux endpoints.' }, 409)
+    }
+    if (!endpointUsesWayland(agent)) {
+      return c.json({ error: 'Remembered Wayland access is only available while the endpoint is using a Wayland desktop session.' }, 409)
+    }
+    if (!versionAtLeast(agent.agent_version, WAYLAND_PERSISTENCE_MIN_AGENT_VERSION)) {
+      return c.json({
+        error: 'Forgetting remembered Wayland access requires Hi5Central Agent ' + WAYLAND_PERSISTENCE_MIN_AGENT_VERSION + ' or newer.',
+        requiredAgentVersion: WAYLAND_PERSISTENCE_MIN_AGENT_VERSION,
+        currentAgentVersion: clean(agent.agent_version) || null,
+      }, 409)
+    }
+
+    const liveSocket = agentSocketForDevice(agent.id)
+    if (!liveSocket || liveSocket.readyState !== 1) {
+      return c.json({ error: 'The Hi5Central Agent is currently offline.' }, 409)
+    }
+
+    const reply = await requestAgentReply(
+      agent.id,
+      'forget_wayland_remote_access',
+      'wayland_persistence_forgotten',
+    )
+    if (!reply) {
+      return c.json({ error: 'The Agent did not confirm that remembered Wayland access was cleared.' }, 504)
+    }
+    if (reply.success !== true) {
+      return c.json({ error: clean(reply.error) || 'Unable to clear remembered Wayland access.' }, 409)
+    }
+    const requestId = clean(reply.request_id) || null
+
+    const actorLabel = clean(auth.session.name || auth.session.email) || 'Technician'
+    recordRmmActivity({
+      tenantId: auth.session.tenant_id,
+      agentDeviceId: agent.id,
+      inventoryId: agent.inventory_id,
+      actorUserId: auth.session.user_id,
+      actorType: 'technician',
+      actorLabel,
+      eventType: 'remote.wayland_persistence_forgotten',
+      category: 'remote',
+      summary: actorLabel + ' cleared remembered Wayland access',
+      detail: 'Hi5Central requested removal of the stored restore token for the active Linux desktop user.',
+      outcome: 'success',
+      severity: 'info',
+      metadata: {
+        platform: 'linux',
+        limitedFeature: true,
+        requestId,
+      },
+    }).catch(() => {})
+
+    return c.json({
+      success: true,
+      requestId,
+      remembered: false,
+      state: 'not_remembered',
+      activeUser: clean(reply.user) || null,
+      limited: true,
+      message: 'Remembered Wayland access was cleared for the active Linux user.',
+    })
+  })
+
   app.get('/api/v1/rmm/remote-sessions', async (c) => {
     const auth = await requireRemoteAccess(c)
     if (auth.error) return auth.error
     const result = await pool.query(
-      `SELECT s.id,s.agent_device_id,s.mode,s.viewer_client,s.status,s.expires_at,s.viewer_connected_at,s.started_at,
+      `SELECT s.id,s.agent_device_id,s.mode,s.viewer_client,s.wayland_persistence,s.status,s.expires_at,s.viewer_connected_at,s.started_at,
               s.last_activity_at,s.created_at,i.name AS device_name,i.reference,
               COALESCE(NULLIF(u.name,''),u.email,'Hi5Central technician') AS technician
          FROM rmm_remote_sessions s
@@ -388,7 +626,7 @@ export function registerRmmRemoteRoutes(app) {
     const auth = await requireRemoteAccess(c)
     if (auth.error) return auth.error
     const result = await pool.query(
-      `SELECT id,agent_device_id,mode,status,expires_at,viewer_connected_at,started_at,ended_at,last_activity_at,end_reason,created_at
+      `SELECT id,agent_device_id,mode,wayland_persistence,status,expires_at,viewer_connected_at,started_at,ended_at,last_activity_at,end_reason,created_at
          FROM rmm_remote_sessions WHERE id=$1 AND tenant_id=$2 LIMIT 1`,
       [clean(c.req.param('sessionId')), auth.session.tenant_id],
     )
@@ -409,7 +647,7 @@ export function registerRmmRemoteRoutes(app) {
 async function authenticateViewer(sessionId, deviceId, token) {
   if (!clean(sessionId) || !clean(deviceId) || !clean(token)) return null
   const result = await pool.query(
-    `SELECT s.id,s.tenant_id,s.agent_device_id,s.inventory_id,s.created_by_user_id,s.mode,s.viewer_client,s.status,s.expires_at,
+    `SELECT s.id,s.tenant_id,s.agent_device_id,s.inventory_id,s.created_by_user_id,s.mode,s.viewer_client,s.wayland_persistence,s.status,s.expires_at,
             u.name AS technician_name,u.email AS technician_email
        FROM rmm_remote_sessions s
        LEFT JOIN users u ON u.id=s.created_by_user_id
@@ -547,7 +785,11 @@ export function attachRmmViewerWebSocket(server) {
             detail: 'Remote session connected successfully.',
             outcome: 'success',
             remoteSessionId: remote.id,
-            metadata: { mode: remote.mode, viewerClient: remote.viewer_client },
+            metadata: {
+              mode: remote.mode,
+              viewerClient: remote.viewer_client,
+              waylandPersistence: remote.wayland_persistence === true,
+            },
           })
         }).catch(() => {})
       } else {
@@ -578,6 +820,7 @@ export function attachRmmViewerWebSocket(server) {
         technician_name: active.technicianName,
         chat_available: remote.mode === 'console',
         iceServers: active.iceAgent,
+        wayland_persistence: remote.wayland_persistence === true,
       })
       if (sent) safeSend(active.viewerWs, { type: 'start_webrtc_sent', session_id: sessionId, restarted })
       return sent

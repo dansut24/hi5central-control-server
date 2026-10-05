@@ -136,6 +136,7 @@ function browserLaunchUrl(slug, connection) {
     token: connection.token,
     wss_url: connection.wssUrl,
     mode: 'console',
+    session_type: 'connect',
     ice,
   })
   const base = tenantUrls(slug, { rmm: true }).rmmUrl || `https://${slug}-rmm.${ROOT_DOMAIN}`
@@ -148,6 +149,7 @@ function nativeLaunchUrl(connection) {
     token: connection.token,
     wss_url: connection.wssUrl,
     mode: 'console',
+    session_type: 'connect',
   })
   return `hi5central-viewer://connect?${query.toString()}`
 }
@@ -343,6 +345,7 @@ export function registerRmmConnectRoutes(app) {
       token,
       wssUrl: CONNECT_VIEWER_WS_URL,
       mode: 'console',
+      sessionType: 'connect',
       iceServers: ice.viewer,
     }
     return c.json({
