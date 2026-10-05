@@ -142,6 +142,29 @@ $afterFree = [int64]$after.FreeSpace
 } | ConvertTo-Json -Depth 4 -Compress
 `
 
+const MACOS_RESET_REMOTE_PERMISSIONS = String.raw`set -eu
+if [ "$(id -u)" -ne 0 ]; then
+  echo '{"success":false,"error":"root_required"}'
+  exit 1
+fi
+
+HELPER_BUNDLE_ID="com.hi5central.remotehelper"
+AGENT_BUNDLE_ID="com.hi5central.agent"
+INSTALLER_BUNDLE_ID="com.hi5central.agent.tenantinstaller"
+HELPER_PROCESS="/Applications/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
+
+/usr/bin/pkill -f "$HELPER_PROCESS" >/dev/null 2>&1 || true
+
+for bundle_id in "$HELPER_BUNDLE_ID" "$AGENT_BUNDLE_ID" "$INSTALLER_BUNDLE_ID"; do
+  /usr/bin/tccutil reset All "$bundle_id" >/dev/null 2>&1 || true
+  for service in Accessibility ScreenCapture ListenEvent PostEvent AppleEvents; do
+    /usr/bin/tccutil reset "$service" "$bundle_id" >/dev/null 2>&1 || true
+  done
+done
+
+printf '%s\n' '{"success":true,"platform":"macos","action":"remote_permissions_reset","helperBundleId":"com.hi5central.remotehelper","nextStep":"Start a new remote session to trigger fresh macOS privacy prompts."}'
+`
+
 const COMPONENT_CLEANUP = String.raw`$ErrorActionPreference = 'Stop'
 $before = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
 $beforeFree = [int64]$before.FreeSpace
@@ -194,6 +217,16 @@ export const BUILTIN_AUTOMATIONS = [
     timeoutSeconds: 3600,
     scriptText: COMPONENT_CLEANUP,
   },
+  {
+    key: 'macos-reset-remote-permissions',
+    name: 'macOS - Reset Remote Permissions',
+    description: 'Resets Hi5Central Remote Helper macOS privacy grants so Screen Recording, Accessibility and input permissions are requested cleanly on the next remote session.',
+    category: 'Remote Support',
+    platform: 'macos',
+    language: 'shell',
+    timeoutSeconds: 120,
+    scriptText: MACOS_RESET_REMOTE_PERMISSIONS,
+  },
 ]
 
 export async function ensureBuiltinAutomations(tenantId) {
@@ -203,6 +236,8 @@ export async function ensureBuiltinAutomations(tenantId) {
     let updated = 0
     let existing = 0
     for (const item of BUILTIN_AUTOMATIONS) {
+      const platform = item.platform || 'windows'
+      const language = item.language || (platform === 'windows' ? 'powershell' : 'shell')
       const desiredHash = sha256(item.scriptText)
       const found = await client.query(
         `SELECT a.id,a.published_version_id,pv.version_number,pv.content_sha256,pv.release_notes,
@@ -236,9 +271,9 @@ export async function ensureBuiltinAutomations(tenantId) {
           )
           await client.query(
             `UPDATE rmm_automations
-                SET description=$2,category=$3,status='published',published_version_id=$4,updated_at=now()
+                SET description=$2,category=$3,platform=$4,language=$5,status='published',published_version_id=$6,updated_at=now()
               WHERE id=$1`,
-            [current.id,item.description,item.category,version.rows[0].id],
+            [current.id,item.description,item.category,platform,language,version.rows[0].id],
           )
           updated += 1
         } else {
@@ -249,9 +284,9 @@ export async function ensureBuiltinAutomations(tenantId) {
       const automation = await client.query(
         `INSERT INTO rmm_automations
           (tenant_id,name,description,category,platform,language,status)
-         VALUES ($1,$2,$3,$4,'windows','powershell','draft')
+         VALUES ($1,$2,$3,$4,$5,$6,'draft')
          RETURNING id`,
-        [tenantId, item.name, item.description, item.category],
+        [tenantId, item.name, item.description, item.category, platform, language],
       )
       const automationId = automation.rows[0].id
       const version = await client.query(

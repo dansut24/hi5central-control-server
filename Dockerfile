@@ -13,7 +13,8 @@ FROM node:24-alpine AS runtime
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force \
+    && apk add --no-cache binutils coreutils dpkg file findutils grep rpm tar
 
 COPY migrations ./migrations
 COPY --from=build /app/dist ./dist

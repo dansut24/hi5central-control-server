@@ -816,7 +816,9 @@ export function attachRmmViewerWebSocket(server) {
         type: 'start_webrtc',
         session_id: sessionId,
         mode: remote.mode,
+        session_type: 'unattended',
         technician_name: active.technicianName,
+        chat_available: remote.mode === 'console',
         iceServers: active.iceAgent,
         wayland_persistence: remote.wayland_persistence === true,
       })

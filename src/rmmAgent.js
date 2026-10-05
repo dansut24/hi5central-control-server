@@ -1,5 +1,12 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { gunzipSync } from 'node:zlib'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { chmodSync, copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { gzipSync, gunzipSync } from 'node:zlib'
+import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { WebSocketServer } from 'ws'
 import { hasPermission } from './access.js'
 import { originMatchesTenant } from './deploymentConfig.js'
@@ -18,6 +25,84 @@ import { resolveSession } from './session.js'
 const AGENT_DOWNLOAD_URL = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe'
 const AGENT_DOWNLOAD_URL_LINUX = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-linux-x64.tar.gz'
 const AGENT_DOWNLOAD_URL_MACOS = 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgent-macOS-universal.tar.gz'
+const TENANT_INSTALLER_REPO = process.env.TENANT_INSTALLER_REPO || 'dansut24/Hi5Central-Agent'
+const TENANT_INSTALLER_WORKFLOW = process.env.TENANT_INSTALLER_WORKFLOW || 'tenant-installer.yml'
+const TENANT_INSTALLER_REF = process.env.TENANT_INSTALLER_REF || 'main'
+const TENANT_INSTALLER_API_BASE = process.env.TENANT_INSTALLER_API_BASE || 'https://api.hi5central.com'
+const TENANT_INSTALLER_ARTIFACT_DIR = process.env.TENANT_INSTALLER_ARTIFACT_DIR || '/srv/tenant-installers'
+const TENANT_INSTALLER_MAX_ARTIFACT_BYTES = 300 * 1024 * 1024
+const TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH = process.env.TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH || path.join(TENANT_INSTALLER_ARTIFACT_DIR, 'templates', 'Hi5CentralAgentTemplate.exe')
+const TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH = process.env.TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH || path.join(TENANT_INSTALLER_ARTIFACT_DIR, 'templates', 'Hi5CentralAgentTemplate.msi')
+const TENANT_INSTALLER_EXE_CONFIG_MAGIC = Buffer.from('H5C0F9A17D42B6E3', 'ascii')
+const TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE = 512
+const TENANT_INSTALLER_MSI_ID_MARKER = Buffer.from('H5MSI_ID_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
+const TENANT_INSTALLER_MSI_SECRET_MARKER = Buffer.from('H5MSI_SECRET_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
+const TENANT_INSTALLER_MSI_API_MARKER = Buffer.from('H5MSI_API_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', 'ascii')
+const TENANT_INSTALLER_GENERIC_URLS = {
+  exe: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.exe',
+  msi: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Windows.msi',
+  app: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.app.zip',
+  pkg: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.pkg',
+  dmg: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-macOS.dmg',
+  run: 'https://downloads.hi5central.com/agent/deployment/latest/Hi5CentralAgentDeployment-Linux.run',
+  deb: 'https://downloads.hi5central.com/agent/deployment/latest/hi5central-agent-deployment_amd64.deb',
+  rpm: 'https://downloads.hi5central.com/agent/deployment/latest/hi5central-agent-deployment_x86_64.rpm',
+}
+const TENANT_INSTALLER_OIDC_AUDIENCE = 'hi5central-tenant-installer'
+const TENANT_INSTALLER_OIDC_ISSUER = 'https://token.actions.githubusercontent.com'
+const TENANT_INSTALLER_OIDC_JWKS = createRemoteJWKSet(
+  new URL('https://token.actions.githubusercontent.com/.well-known/jwks'),
+)
+const TENANT_INSTALLER_ASSETS = {
+  exe: {
+    platform: 'windows',
+    fileName: 'Hi5CentralAgentTenant-Windows.exe',
+    contentType: 'application/vnd.microsoft.portable-executable',
+    downloadName: (id) => `Hi5CentralAgent-${id}-Windows.exe`,
+  },
+  msi: {
+    platform: 'windows',
+    fileName: 'Hi5CentralAgentTenant-Windows.msi',
+    contentType: 'application/x-msi',
+    downloadName: (id) => `Hi5CentralAgent-${id}-Windows.msi`,
+  },
+  pkg: {
+    platform: 'macos',
+    fileName: 'Hi5CentralAgentTenant-macOS.pkg',
+    contentType: 'application/octet-stream',
+    downloadName: (id) => `Hi5CentralAgent-${id}-macOS.pkg`,
+  },
+  dmg: {
+    platform: 'macos',
+    fileName: 'Hi5CentralAgentTenant-macOS.dmg',
+    contentType: 'application/x-apple-diskimage',
+    downloadName: (id) => `Hi5CentralAgent-${id}-macOS.dmg`,
+  },
+  app: {
+    platform: 'macos',
+    fileName: 'Hi5CentralAgentTenant-macOS.app.zip',
+    contentType: 'application/zip',
+    downloadName: (id) => `Hi5CentralAgent-${id}-macOS.app.zip`,
+  },
+  run: {
+    platform: 'linux',
+    fileName: 'Hi5CentralAgentTenant-Linux.run',
+    contentType: 'application/octet-stream',
+    downloadName: (id) => `Hi5CentralAgent-${id}-Linux.run`,
+  },
+  deb: {
+    platform: 'linux',
+    fileName: 'hi5central-agent-tenant_amd64.deb',
+    contentType: 'application/vnd.debian.binary-package',
+    downloadName: (id) => `hi5central-agent-${id}_amd64.deb`,
+  },
+  rpm: {
+    platform: 'linux',
+    fileName: 'hi5central-agent-tenant_x86_64.rpm',
+    contentType: 'application/x-rpm',
+    downloadName: (id) => `hi5central-agent-${id}.x86_64.rpm`,
+  },
+}
 const PORTABLE_AGENT_RELEASE_MANIFEST_URL = process.env.PORTABLE_AGENT_RELEASE_MANIFEST_URL || 'https://downloads.hi5central.com/agent/latest/portable-manifest.json'
 const PORTABLE_AGENT_RELEASE_CACHE_MS = 60_000
 let portableAgentReleaseSyncAt = 0
@@ -43,6 +128,597 @@ function canonicalAgentPlatform(value = '') {
 function isUuid(value = '') { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean(value)) }
 function sha256(value = '') { return createHash('sha256').update(String(value)).digest('hex') }
 function secret(prefix) { return `${prefix}_${randomBytes(32).toString('base64url')}` }
+
+function tenantInstallerSelection(platformValue = '', formatValue = '') {
+  const platform = clean(platformValue).toLowerCase()
+  const format = clean(formatValue).toLowerCase()
+  const definition = TENANT_INSTALLER_ASSETS[format]
+  if (!definition || definition.platform !== platform) return null
+  if (platform === 'windows' && !['exe', 'msi'].includes(format)) return null
+  return { platform, format, definition }
+}
+
+function linuxTenantInstallerInstallCommand(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  const packageName = format === 'deb'
+    ? 'hi5centralagent.deb'
+    : format === 'rpm'
+      ? 'hi5centralagent.rpm'
+      : ''
+  const rootInstall = format === 'deb'
+    ? 'dpkg -i "$HI5_PKG"'
+    : format === 'rpm'
+      ? 'rpm -Uvh "$HI5_PKG"'
+      : ''
+
+  if (packageName && rootInstall) {
+    return '(' + [
+      'HI5_PKG="$PWD/' + packageName + '"',
+      '[ -f "$HI5_PKG" ] || { echo "Installer not found: $HI5_PKG"; exit 1; }',
+      'HI5_INSTALL=' + JSON.stringify(rootInstall),
+      'if [ "$(id -u)" -eq 0 ]; then /bin/sh -c "$HI5_INSTALL"',
+      'elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\n" | grep -Eq "^(sudo|wheel)$"; then sudo /bin/sh -c "$HI5_INSTALL"',
+      'elif command -v pkexec >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then pkexec /usr/bin/env HI5_PKG="$HI5_PKG" /bin/sh -c "$HI5_INSTALL" || { echo "Graphical elevation failed; enter the root password instead."; su -c "HI5_PKG=\\\"$HI5_PKG\\\" /bin/sh -c \\\"$HI5_INSTALL\\\""; }',
+      'else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_PKG=\\\"$HI5_PKG\\\" /bin/sh -c \\\"$HI5_INSTALL\\\""',
+      'fi',
+    ].join('; ') + ')'
+  }
+
+  if (format !== 'run') return ''
+
+  const fileName = 'Hi5CentralAgentDeployment-Linux.run'
+  const bundleName = linuxTenantInstallerBundleName(format)
+  const installCommand = 'if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl tar; elif command -v yum >/dev/null 2>&1; then yum install -y curl tar; else echo "curl and tar are required before installing the Hi5Central Agent."; exit 1; fi; fi && chmod 0755 "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" && "$HI5_DIR/Hi5CentralAgentDeployment-Linux.run" --config "$HI5_DIR/Hi5CentralDeployment.json"'
+  return '(' + [
+    'HI5_DIR="$PWD"',
+    'HI5_EXTRACT=""',
+    'HI5_BUNDLE="$HI5_DIR/' + bundleName + '"',
+    'if { [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/' + fileName + '" ]; } && [ ! -f "$HI5_BUNDLE" ]; then HI5_DOWNLOADS="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DOWNLOAD 2>/dev/null || true)"; [ -n "$HI5_DOWNLOADS" ] || HI5_DOWNLOADS="$HOME/Downloads"; HI5_DIR="$HI5_DOWNLOADS"; HI5_BUNDLE="$HI5_DIR/' + bundleName + '"; fi',
+    'if { [ ! -f "$HI5_DIR/Hi5CentralDeployment.json" ] || [ ! -f "$HI5_DIR/' + fileName + '" ]; } && [ -f "$HI5_BUNDLE" ]; then command -v tar >/dev/null 2>&1 || { echo "tar is required to unpack the Hi5Central deployment bundle."; exit 1; }; HI5_EXTRACT="$(mktemp -d /tmp/hi5central-deploy.XXXXXX)" || exit 1; tar -xzf "$HI5_BUNDLE" -C "$HI5_EXTRACT" || { rm -rf "$HI5_EXTRACT"; exit 1; }; HI5_DIR="$HI5_EXTRACT"; fi',
+    '[ -f "$HI5_DIR/Hi5CentralDeployment.json" ] && [ -f "$HI5_DIR/' + fileName + '" ] || { echo "Hi5Central deployment bundle or installer files were not found in the current folder or Downloads."; [ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"; exit 1; }',
+    'HI5_INSTALL=' + JSON.stringify(installCommand),
+    'if [ "$(id -u)" -eq 0 ]; then HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v sudo >/dev/null 2>&1 && id -nG | tr " " "\n" | grep -Eq "^(sudo|wheel)$"; then sudo /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; elif command -v pkexec >/dev/null 2>&1; then pkexec /usr/bin/env HI5_DIR="$HI5_DIR" /bin/sh -c "$HI5_INSTALL"; HI5_STATUS=$?; else echo "Administrator privileges are required. Enter the root password when prompted."; su -c "HI5_DIR=\"$HI5_DIR\" /bin/sh -c \'$HI5_INSTALL\'"; HI5_STATUS=$?; fi',
+    '[ -n "$HI5_EXTRACT" ] && rm -rf "$HI5_EXTRACT"',
+    'exit "$HI5_STATUS"',
+  ].join('; ') + ')'
+}
+
+function tenantInstallerInstallCommand(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (format === 'exe') return '.\\Hi5CentralAgent.exe --quiet'
+  if (format === 'msi') return 'msiexec /i "Hi5CentralAgent.msi" /qn /norestart'
+  if (['run', 'deb', 'rpm'].includes(format)) return linuxTenantInstallerInstallCommand(format)
+  if (format === 'pkg') return 'Place Hi5CentralDeployment.json at /Library/Application Support/Hi5Central/Deployment.json before installing the PKG.'
+  if (format === 'dmg' || format === 'app') return 'Place Hi5CentralDeployment.json beside the app or in Downloads, then open the Hi5Central Agent app.'
+  return ''
+}
+
+function writeFixedInstallerField(buffer, offset, capacity, value) {
+  const encoded = Buffer.from(String(value || ''), 'utf8')
+  if (encoded.length >= capacity) throw new Error('Tenant installer embedded field is too long.')
+  buffer.fill(0, offset, offset + capacity)
+  encoded.copy(buffer, offset)
+}
+
+function writeFixedTemplateMarker(buffer, marker, value) {
+  const encoded = Buffer.from(String(value || ''), 'utf8')
+  if (!marker?.length || encoded.length > marker.length) {
+    throw new Error('Tenant installer template field is too long.')
+  }
+  const first = buffer.indexOf(marker)
+  const last = buffer.lastIndexOf(marker)
+  if (first < 0 || first !== last) {
+    throw new Error('Tenant installer template marker is invalid.')
+  }
+  buffer.fill(0x20, first, first + marker.length)
+  encoded.copy(buffer, first)
+}
+
+function windowsTenantInstallerBuffer(packageId, formatValue = 'exe') {
+  const format = clean(formatValue).toLowerCase()
+  if (format === 'exe') {
+    if (!existsSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)) {
+      throw new Error('Windows EXE tenant installer template is not published.')
+    }
+
+    const template = readFileSync(TENANT_INSTALLER_WINDOWS_TEMPLATE_PATH)
+    const first = template.indexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+    const last = template.lastIndexOf(TENANT_INSTALLER_EXE_CONFIG_MAGIC)
+    if (first < 0 || first !== last || first + TENANT_INSTALLER_EXE_CONFIG_BLOCK_SIZE > template.length) {
+      throw new Error('Windows EXE tenant installer template configuration block is invalid.')
+    }
+
+    const output = Buffer.from(template)
+    const blockStart = first
+    writeFixedInstallerField(output, blockStart + 24, 64, packageId)
+    writeFixedInstallerField(output, blockStart + 24 + 64, 128, tenantInstallerDeploymentSecret(packageId))
+    writeFixedInstallerField(output, blockStart + 24 + 64 + 128, 256, TENANT_INSTALLER_API_BASE)
+    return output
+  }
+
+  if (format === 'msi') {
+    if (!existsSync(TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH)) {
+      throw new Error('Windows MSI tenant installer template is not published.')
+    }
+
+    const output = Buffer.from(readFileSync(TENANT_INSTALLER_WINDOWS_MSI_TEMPLATE_PATH))
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_ID_MARKER, packageId)
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_SECRET_MARKER, tenantInstallerDeploymentSecret(packageId))
+    writeFixedTemplateMarker(output, TENANT_INSTALLER_MSI_API_MARKER, TENANT_INSTALLER_API_BASE)
+    return output
+  }
+
+  throw new Error('Unsupported Windows tenant installer format.')
+}
+
+function tenantInstallerUrl(packageId, formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (['exe', 'msi', 'deb', 'rpm'].includes(format)) {
+    return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/installer'
+  }
+  return TENANT_INSTALLER_GENERIC_URLS[format] || null
+}
+function tenantInstallerBundleUrl(packageId, platformValue = '', formatValue = '') {
+  const platform = clean(platformValue).toLowerCase()
+  const format = clean(formatValue).toLowerCase()
+  if (platform !== 'linux' || format !== 'run') return null
+  return TENANT_INSTALLER_API_BASE + '/api/v1/rmm/agent/enrollment-packages/' + packageId + '/bundle'
+}
+
+function linuxTenantInstallerBundleName(formatValue = '') {
+  const format = clean(formatValue).toLowerCase()
+  if (!['run', 'deb', 'rpm'].includes(format)) return ''
+  return 'Hi5CentralAgentDeployment-Linux-' + format.toUpperCase() + '.tar.gz'
+}
+
+function tarOctal(value, length) {
+  const text = Math.max(0, Number(value) || 0).toString(8).padStart(length - 1, '0')
+  return text.slice(-(length - 1)) + '\0'
+}
+
+function tarEntry(name, content, mode = 0o644) {
+  const body = Buffer.isBuffer(content) ? content : Buffer.from(content)
+  const header = Buffer.alloc(512, 0)
+  Buffer.from(name, 'utf8').copy(header, 0, 0, 100)
+  Buffer.from(tarOctal(mode, 8), 'ascii').copy(header, 100)
+  Buffer.from(tarOctal(0, 8), 'ascii').copy(header, 108)
+  Buffer.from(tarOctal(0, 8), 'ascii').copy(header, 116)
+  Buffer.from(tarOctal(body.length, 12), 'ascii').copy(header, 124)
+  Buffer.from(tarOctal(Math.floor(Date.now() / 1000), 12), 'ascii').copy(header, 136)
+  header.fill(0x20, 148, 156)
+  header[156] = 0x30
+  Buffer.from('ustar\0', 'ascii').copy(header, 257)
+  Buffer.from('00', 'ascii').copy(header, 263)
+  Buffer.from('root', 'ascii').copy(header, 265)
+  Buffer.from('root', 'ascii').copy(header, 297)
+  let checksum = 0
+  for (const byte of header) checksum += byte
+  Buffer.from(checksum.toString(8).padStart(6, '0') + '\0 ', 'ascii').copy(header, 148)
+  const padding = Buffer.alloc((512 - (body.length % 512)) % 512, 0)
+  return Buffer.concat([header, body, padding])
+}
+
+function tarGzip(entries) {
+  const tar = Buffer.concat([
+    ...entries.map((entry) => tarEntry(entry.name, entry.content, entry.mode)),
+    Buffer.alloc(1024, 0),
+  ])
+  return gzipSync(tar, { level: 9 })
+}
+
+function tenantInstallerDeploymentConfig(pkg) {
+  return {
+    schemaVersion: 1,
+    apiBase: TENANT_INSTALLER_API_BASE,
+    deploymentId: pkg.id,
+    deploymentSecret: tenantInstallerDeploymentSecret(pkg.id),
+    installerPlatform: pkg.installer_platform,
+    installerFormat: pkg.installer_format,
+  }
+}
+
+
+function runPackagingCommand(command, args, cwd = undefined) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, HOME: process.env.HOME || '/tmp' },
+  })
+  if (result.error) {
+    throw new Error(command + ' is unavailable in the API container: ' + result.error.message)
+  }
+  if (result.status !== 0) {
+    const detail = clean(result.stderr || result.stdout).slice(0, 2000)
+    throw new Error(command + ' failed' + (detail ? ': ' + detail : '.'))
+  }
+}
+
+async function currentLinuxPackageVersion() {
+  try {
+    const response = await fetch(PORTABLE_AGENT_RELEASE_MANIFEST_URL, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(4_000),
+    })
+    if (!response.ok) throw new Error('manifest HTTP ' + response.status)
+    const manifest = await response.json()
+    const version = clean(manifest?.platforms?.linux?.version)
+    if (/^\d+\.\d+\.\d+$/.test(version)) return version
+  } catch {}
+  return '0.3.0'
+}
+
+function linuxTenantPackageServiceUnit() {
+  return `[Unit]
+Description=Hi5Central Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/hi5central/agent/Hi5CentralAgent --state-dir /var/lib/hi5central/agent --deployment-config /etc/hi5central/deployment.json --service
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+RuntimeDirectory=hi5central
+RuntimeDirectoryMode=0755
+ReadWritePaths=/var/lib/hi5central/agent /var/lib/hi5central/portal /run/hi5central /etc/hi5central
+
+[Install]
+WantedBy=multi-user.target
+`
+}
+
+function linuxTenantPackageDesktopEntry() {
+  return `[Desktop Entry]
+Type=Application
+Name=Hi5Central Remote Helper
+Comment=Hi5Central remote desktop session helper
+Exec=/opt/hi5central/agent/Hi5CentralRemoteHelper --remote-helper
+TryExec=/opt/hi5central/agent/Hi5CentralRemoteHelper
+Icon=computer
+Terminal=false
+NoDisplay=true
+Categories=System;RemoteAccess;
+`
+}
+
+async function linuxTenantInstallerPackage(pkg) {
+  const format = clean(pkg?.installer_format).toLowerCase()
+  if (clean(pkg?.installer_platform).toLowerCase() !== 'linux' || !['deb', 'rpm'].includes(format)) {
+    throw new Error('This deployment is not a supported self-contained Linux installer.')
+  }
+
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'hi5central-linux-package-'))
+  try {
+    const response = await fetch(AGENT_DOWNLOAD_URL_LINUX, { signal: AbortSignal.timeout(45_000) })
+    if (!response.ok) throw new Error('Linux Agent payload download failed HTTP ' + response.status + '.')
+    const archive = Buffer.from(await response.arrayBuffer())
+    if (!archive.length || archive.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+      throw new Error('Linux Agent payload has an invalid size.')
+    }
+
+    const archivePath = path.join(tempRoot, 'agent.tar.gz')
+    const extractRoot = path.join(tempRoot, 'payload')
+    const packageRoot = path.join(tempRoot, 'root')
+    writeFileSync(archivePath, archive, { mode: 0o600 })
+    mkdirSync(extractRoot, { recursive: true, mode: 0o700 })
+    runPackagingCommand('tar', ['-xzf', archivePath, '-C', extractRoot])
+
+    const sourceAgent = path.join(extractRoot, 'Hi5CentralAgent')
+    const sourceHelper = path.join(extractRoot, 'Hi5CentralRemoteHelper')
+    if (!existsSync(sourceAgent) || !existsSync(sourceHelper)) {
+      throw new Error('Published Linux Agent payload is incomplete.')
+    }
+
+    const installDir = path.join(packageRoot, 'opt', 'hi5central', 'agent')
+    const configDir = path.join(packageRoot, 'etc', 'hi5central')
+    const systemdDir = path.join(packageRoot, 'etc', 'systemd', 'system')
+    const desktopDir = path.join(packageRoot, 'usr', 'share', 'applications')
+    mkdirSync(installDir, { recursive: true, mode: 0o755 })
+    mkdirSync(configDir, { recursive: true, mode: 0o700 })
+    mkdirSync(systemdDir, { recursive: true, mode: 0o755 })
+    mkdirSync(desktopDir, { recursive: true, mode: 0o755 })
+
+    const agentPath = path.join(installDir, 'Hi5CentralAgent')
+    const helperPath = path.join(installDir, 'Hi5CentralRemoteHelper')
+    copyFileSync(sourceAgent, agentPath)
+    copyFileSync(sourceHelper, helperPath)
+    chmodSync(agentPath, 0o755)
+    chmodSync(helperPath, 0o755)
+
+    writeFileSync(
+      path.join(configDir, 'deployment.json'),
+      JSON.stringify(tenantInstallerDeploymentConfig(pkg), null, 2) + '\n',
+      { mode: 0o600 },
+    )
+    writeFileSync(
+      path.join(systemdDir, 'hi5central-agent.service'),
+      linuxTenantPackageServiceUnit(),
+      { mode: 0o644 },
+    )
+    writeFileSync(
+      path.join(desktopDir, 'com.hi5central.RemoteHelper.desktop'),
+      linuxTenantPackageDesktopEntry(),
+      { mode: 0o644 },
+    )
+
+    const version = await currentLinuxPackageVersion()
+
+    if (format === 'deb') {
+      const debianDir = path.join(packageRoot, 'DEBIAN')
+      mkdirSync(debianDir, { recursive: true, mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'control'), `Package: hi5central-agent
+Version: ${version}
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Hi5Central <hello@hi5central.com>
+Conflicts: hi5central-agent-deployment
+Replaces: hi5central-agent-deployment
+Description: Hi5Central RMM Agent
+ Self-contained Hi5Central Agent with a revocable tenant deployment credential.
+`)
+      const postinst = `#!/bin/sh
+set +e
+install -d -m 0700 /var/lib/hi5central/agent
+install -d -m 0755 /var/lib/hi5central/portal
+install -d -m 0755 /run/hi5central
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable hi5central-agent.service >/dev/null 2>&1 || true
+systemctl restart hi5central-agent.service >/dev/null 2>&1 || true
+exit 0
+`
+      const prerm = `#!/bin/sh
+set +e
+if [ "$1" = "remove" ]; then
+  systemctl stop hi5central-agent.service >/dev/null 2>&1 || true
+  systemctl disable hi5central-agent.service >/dev/null 2>&1 || true
+fi
+exit 0
+`
+      const postrm = `#!/bin/sh
+set +e
+systemctl daemon-reload >/dev/null 2>&1 || true
+exit 0
+`
+      writeFileSync(path.join(debianDir, 'postinst'), postinst, { mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'prerm'), prerm, { mode: 0o755 })
+      writeFileSync(path.join(debianDir, 'postrm'), postrm, { mode: 0o755 })
+
+      const outputPath = path.join(tempRoot, 'hi5centralagent.deb')
+      runPackagingCommand('dpkg-deb', ['--build', '--root-owner-group', packageRoot, outputPath])
+      const output = readFileSync(outputPath)
+      if (!output.length || output.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+        throw new Error('Generated DEB has an invalid size.')
+      }
+      return output
+    }
+
+    const topdir = path.join(tempRoot, 'rpmbuild')
+    for (const name of ['BUILD', 'BUILDROOT', 'RPMS', 'SOURCES', 'SPECS', 'SRPMS']) {
+      mkdirSync(path.join(topdir, name), { recursive: true, mode: 0o755 })
+    }
+    const specPath = path.join(topdir, 'SPECS', 'hi5central-agent.spec')
+    const spec = `Name: hi5central-agent
+Version: ${version}
+Release: 1
+Summary: Hi5Central RMM Agent
+License: Proprietary
+BuildArch: x86_64
+AutoReqProv: no
+Conflicts: hi5central-agent-deployment
+
+%description
+Self-contained Hi5Central Agent with a revocable tenant deployment credential.
+
+%prep
+%build
+%install
+mkdir -p %{buildroot}
+cp -a %{payload_root}/. %{buildroot}/
+rm -rf %{buildroot}/DEBIAN
+
+%post
+install -d -m 0700 /var/lib/hi5central/agent
+install -d -m 0755 /var/lib/hi5central/portal
+install -d -m 0755 /run/hi5central
+systemctl daemon-reload >/dev/null 2>&1 || :
+systemctl enable hi5central-agent.service >/dev/null 2>&1 || :
+systemctl restart hi5central-agent.service >/dev/null 2>&1 || :
+
+%preun
+if [ "$1" -eq 0 ]; then
+  systemctl stop hi5central-agent.service >/dev/null 2>&1 || :
+  systemctl disable hi5central-agent.service >/dev/null 2>&1 || :
+fi
+
+%postun
+systemctl daemon-reload >/dev/null 2>&1 || :
+
+%files
+%dir /opt/hi5central
+%dir /opt/hi5central/agent
+/opt/hi5central/agent/Hi5CentralAgent
+/opt/hi5central/agent/Hi5CentralRemoteHelper
+%dir /etc/hi5central
+%config(noreplace) /etc/hi5central/deployment.json
+/etc/systemd/system/hi5central-agent.service
+/usr/share/applications/com.hi5central.RemoteHelper.desktop
+`
+    writeFileSync(specPath, spec, { mode: 0o644 })
+    runPackagingCommand('rpmbuild', [
+      '-bb',
+      '--define', '_topdir ' + topdir,
+      '--define', 'payload_root ' + packageRoot,
+      specPath,
+    ])
+
+    const outputPath = path.join(topdir, 'RPMS', 'x86_64', `hi5central-agent-${version}-1.x86_64.rpm`)
+    if (!existsSync(outputPath)) throw new Error('Generated RPM output was not found.')
+    const output = readFileSync(outputPath)
+    if (!output.length || output.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+      throw new Error('Generated RPM has an invalid size.')
+    }
+    return output
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+}
+
+async function linuxTenantInstallerBundle(pkg) {
+  const format = clean(pkg?.installer_format).toLowerCase()
+  const installerUrl = TENANT_INSTALLER_GENERIC_URLS[format]
+  const definition = TENANT_INSTALLER_ASSETS[format]
+  if (clean(pkg?.installer_platform).toLowerCase() !== 'linux' || !installerUrl || !definition) {
+    throw new Error('This deployment is not a supported Linux installer.')
+  }
+  const response = await fetch(installerUrl, { signal: AbortSignal.timeout(30_000) })
+  if (!response.ok) throw new Error('Linux installer download failed HTTP ' + response.status + '.')
+  const installer = Buffer.from(await response.arrayBuffer())
+  if (!installer.length || installer.length > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+    throw new Error('Linux installer has an invalid size.')
+  }
+  const config = Buffer.from(JSON.stringify(tenantInstallerDeploymentConfig(pkg), null, 2) + '\n', 'utf8')
+  const installerName = format === 'run'
+    ? 'Hi5CentralAgentDeployment-Linux.run'
+    : format === 'deb'
+      ? 'hi5central-agent-deployment_amd64.deb'
+      : 'hi5central-agent-deployment_x86_64.rpm'
+  return tarGzip([
+    { name: installerName, content: installer, mode: format === 'run' ? 0o755 : 0o644 },
+    { name: 'Hi5CentralDeployment.json', content: config, mode: 0o600 },
+  ])
+}
+
+
+function tenantInstallerHmacKey() {
+  return clean(process.env.TENANT_INSTALLER_HMAC_KEY || process.env.CONNECT_CODE_HMAC_KEY)
+}
+
+function tenantInstallerDeploymentSecret(packageId) {
+  const key = tenantInstallerHmacKey()
+  if (!key) throw new Error('Tenant installer HMAC key is not configured.')
+  return createHmac('sha256', key)
+    .update('hi5central-tenant-installer:' + clean(packageId))
+    .digest('base64url')
+}
+
+function constantTimeTextEqual(left = '', right = '') {
+  const a = Buffer.from(String(left))
+  const b = Buffer.from(String(right))
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+function tenantInstallerDirectory(packageId) {
+  return path.join(TENANT_INSTALLER_ARTIFACT_DIR, clean(packageId))
+}
+
+function tenantInstallerArtifactPath(packageId, format) {
+  const definition = TENANT_INSTALLER_ASSETS[format]
+  if (!definition) return ''
+  return path.join(tenantInstallerDirectory(packageId), definition.fileName)
+}
+
+function tenantInstallerArtifactRows(packageId, selectedFormat = '') {
+  const entries = Object.entries(TENANT_INSTALLER_ASSETS)
+    .filter(([format]) => !selectedFormat || format === clean(selectedFormat).toLowerCase())
+  return entries.map(([format, definition]) => {
+    const artifactPath = tenantInstallerArtifactPath(packageId, format)
+    let sizeBytes = 0
+    let ready = false
+    try {
+      const stats = statSync(artifactPath)
+      ready = stats.isFile() && stats.size > 0
+      sizeBytes = ready ? stats.size : 0
+    } catch {}
+    return {
+      format,
+      platform: definition.platform,
+      fileName: definition.downloadName(packageId),
+      ready,
+      sizeBytes,
+      downloadUrl: `/api/v1/rmm/agent/enrollment-packages/${packageId}/artifacts/${format}`,
+    }
+  })
+}
+
+let tenantInstallerGithubTokenCache = null
+function tenantInstallerGithubToken() {
+  if (tenantInstallerGithubTokenCache !== null) return tenantInstallerGithubTokenCache
+  tenantInstallerGithubTokenCache = clean(process.env.GITHUB_ACTIONS_TOKEN || process.env.GITHUB_TOKEN)
+  if (tenantInstallerGithubTokenCache) return tenantInstallerGithubTokenCache
+  for (const candidate of ['/run/secrets/github_actions_token', '/run/secrets/github_token']) {
+    try {
+      tenantInstallerGithubTokenCache = clean(readFileSync(candidate, 'utf8'))
+      if (tenantInstallerGithubTokenCache) return tenantInstallerGithubTokenCache
+    } catch {}
+  }
+  tenantInstallerGithubTokenCache = ''
+  return ''
+}
+
+async function requestTenantInstallerBuild(packageId, installerPlatform = '', installerFormat = '') {
+  const token = tenantInstallerGithubToken()
+  if (!token) throw new Error('GitHub Actions token is not configured for tenant installer builds.')
+  const response = await fetch(
+    `https://api.github.com/repos/${TENANT_INSTALLER_REPO}/actions/workflows/${encodeURIComponent(TENANT_INSTALLER_WORKFLOW)}/dispatches`,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      body: JSON.stringify({
+        ref: TENANT_INSTALLER_REF,
+        inputs: {
+          deployment_id: clean(packageId),
+          api_base: TENANT_INSTALLER_API_BASE,
+          target_platform: clean(installerPlatform).toLowerCase(),
+          target_format: clean(installerFormat).toLowerCase(),
+        },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    },
+  )
+  if (!response.ok) {
+    const detail = clean(await response.text())
+    throw new Error(
+      `Tenant installer build dispatch failed HTTP ${response.status}` +
+      (detail ? ': ' + detail.slice(0, 300) : ''),
+    )
+  }
+}
+
+async function verifyTenantInstallerBuilder(c) {
+  const header = clean(c.req.header('authorization'))
+  if (!/^Bearer\s+/i.test(header)) return null
+  const token = header.replace(/^Bearer\s+/i, '')
+  try {
+    const verified = await jwtVerify(token, TENANT_INSTALLER_OIDC_JWKS, {
+      issuer: TENANT_INSTALLER_OIDC_ISSUER,
+      audience: TENANT_INSTALLER_OIDC_AUDIENCE,
+    })
+    const payload = verified.payload || {}
+    const expectedWorkflowRef =
+      `${TENANT_INSTALLER_REPO}/.github/workflows/${TENANT_INSTALLER_WORKFLOW}@refs/heads/${TENANT_INSTALLER_REF}`
+    if (payload.repository !== TENANT_INSTALLER_REPO) return null
+    if (payload.ref !== `refs/heads/${TENANT_INSTALLER_REF}`) return null
+    if (payload.workflow_ref !== expectedWorkflowRef) return null
+    if (payload.event_name !== 'workflow_dispatch') return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
 function boundedNumber(value, min, max) {
   const number = Number(value)
   if (!Number.isFinite(number)) return null
@@ -252,7 +928,7 @@ function agentUpgradeScript(release) {
     "$installerArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /INSTALL_SOURCE=agent-upgrade /LOG=' + [char]34 + $logPath + [char]34",
     "$runner = Join-Path $upgradeDir 'run-upgrade-" + version + ".ps1'",
     "$resultPath = Join-Path $upgradeDir 'result-" + version + ".json'",
-    "$runnerScript = '$ErrorActionPreference = ''Stop''' + [Environment]::NewLine + '$installer = ''' + $installer + '''' + [Environment]::NewLine + '$installerArgs = ''' + $installerArgs + '''' + [Environment]::NewLine + '$resultPath = ''' + $resultPath + '''' + [Environment]::NewLine + '$started = Get-Date' + [Environment]::NewLine + 'try { Stop-Service -Name Hi5CentralAgent -Force -ErrorAction SilentlyContinue; $deadline=(Get-Date).AddSeconds(30); do { $p=Get-Process Hi5CentralAgentService -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); if ($p) { Stop-Process -Id $p.Id -Force -ErrorAction Stop; Start-Sleep -Seconds 2 }; @(''Hi5CentralAppPortal'',''Hi5CentralUser'',''Hi5CentralRemoteHost'',''Hi5CentralMediaHost'',''Hi5CentralPatchHost'') | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 750; $proc=Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru; $code=$proc.ExitCode; if ($code -ne 0) { throw (''Installer exited with code '' + $code) }; $portalPath=Join-Path $env:ProgramFiles ''Hi5Central\\Agent\\Hi5CentralAppPortal.exe''; if (-not (Test-Path -LiteralPath $portalPath)) { throw ''Hi5 Self Service executable is missing after upgrade.'' }; $portalVersion=[string](Get-Item -LiteralPath $portalPath).VersionInfo.FileVersion; if (-not $portalVersion.StartsWith(''" + version + "'',[System.StringComparison]::OrdinalIgnoreCase)) { throw (''Hi5 Self Service version verification failed. Expected " + version + " but found '' + $portalVersion) }; Start-Service -Name Hi5CentralAgent -ErrorAction Stop; [pscustomobject]@{status=''succeeded'';started=$started;completed=(Get-Date);installer_exit_code=$code;portal_version=$portalVersion} | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding UTF8; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue } catch { $message=$_.Exception.Message; Start-Service -Name Hi5CentralAgent -ErrorAction SilentlyContinue; [pscustomobject]@{status=''failed'';started=$started;completed=(Get-Date);error=$message} | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding UTF8; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; exit 1 }'",
+    "$runnerScript = '$ErrorActionPreference = ''Stop''' + [Environment]::NewLine + '$installer = ''' + $installer + '''' + [Environment]::NewLine + '$installerArgs = ''' + $installerArgs + '''' + [Environment]::NewLine + '$resultPath = ''' + $resultPath + '''' + [Environment]::NewLine + '$started = Get-Date' + [Environment]::NewLine + 'try { Stop-Service -Name Hi5CentralAgent -Force -ErrorAction SilentlyContinue; $deadline=(Get-Date).AddSeconds(30); do { $p=Get-Process Hi5CentralAgent -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); if ($p) { Stop-Process -Id $p.Id -Force -ErrorAction Stop; Start-Sleep -Seconds 2 }; @(''Hi5CentralAppPortal'',''Hi5CentralUser'',''Hi5CentralRemoteHost'',''Hi5CentralMediaHost'',''Hi5CentralPatchHost'') | ForEach-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 750; $proc=Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru; $code=$proc.ExitCode; if ($code -ne 0) { throw (''Installer exited with code '' + $code) }; Start-Service -Name Hi5CentralAgent -ErrorAction Stop; [pscustomobject]@{status=''succeeded'';started=$started;completed=(Get-Date);installer_exit_code=$code} | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding UTF8; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue } catch { $message=$_.Exception.Message; Start-Service -Name Hi5CentralAgent -ErrorAction SilentlyContinue; [pscustomobject]@{status=''failed'';started=$started;completed=(Get-Date);error=$message} | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding UTF8; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; exit 1 }'",
     "Set-Content -LiteralPath $runner -Value $runnerScript -Encoding UTF8",
     "$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + [char]34 + $runner + [char]34)",
     "$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(35)",
@@ -719,11 +1395,11 @@ async function ingestInventory(agent, payload) {
     await client.query(
       `UPDATE rmm_agent_devices SET
          agent_version=COALESCE(NULLIF($2,''),agent_version),
-         last_inventory_at=$3::timestamptz,
+         last_inventory_at=now(),
          last_authenticated_at=now(),
          updated_at=now()
        WHERE id=$1`,
-      [agent.id, clean(agentInfo.version), collectedAt],
+      [agent.id, clean(agentInfo.version)],
     )
 
     if (platform === 'Windows') {
@@ -748,10 +1424,28 @@ async function ingestInventory(agent, payload) {
 
 async function packageRows(tenantId) {
   const result = await pool.query(
-    `SELECT id,label,token_hint,expires_at,max_uses,use_count,last_used_at,revoked_at,created_at
-       FROM rmm_agent_enrollment_packages
-      WHERE tenant_id=$1
-      ORDER BY created_at DESC
+    `SELECT p.id,p.label,p.token_hint,p.expires_at,p.max_uses,
+            CASE WHEN p.persistent
+              THEN p.use_count + COALESCE(children.child_use_count,0)
+              ELSE p.use_count
+            END AS use_count,
+            COALESCE(
+              GREATEST(p.last_used_at,children.child_last_used_at),
+              p.last_used_at,
+              children.child_last_used_at
+            ) AS last_used_at,
+            p.revoked_at,p.created_at,p.persistent,p.installer_platform,p.installer_format,
+            p.artifact_build_requested_at,p.artifact_build_completed_at,p.artifact_build_error
+       FROM rmm_agent_enrollment_packages p
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM(child.use_count),0)::integer AS child_use_count,
+                MAX(child.last_used_at) AS child_last_used_at
+           FROM rmm_agent_enrollment_packages child
+          WHERE child.parent_deployment_id=p.id
+       ) children ON true
+      WHERE p.tenant_id=$1
+        AND p.parent_deployment_id IS NULL
+      ORDER BY p.created_at DESC
       LIMIT 25`,
     [tenantId],
   )
@@ -761,13 +1455,26 @@ export function registerRmmAgentRoutes(app) {
   app.get('/api/v1/rmm/agent/enrollment-packages', async (c) => {
     const auth = await requireRmmManager(c)
     if (auth.error) return auth.error
+    const packages = (await packageRows(auth.session.tenant_id)).map((pkg) => ({
+      ...pkg,
+      installer_url: pkg.persistent && pkg.installer_format
+        ? (tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format))
+        : null,
+      bundle_url: pkg.persistent
+        ? tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format)
+        : null,
+      deployment_config_url: pkg.persistent && !['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)
+        ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
+        : null,
+      install_command: pkg.persistent ? tenantInstallerInstallCommand(pkg.installer_format) : null,
+    }))
     return c.json({
-      packages: await packageRows(auth.session.tenant_id),
+      packages,
       downloadUrl: AGENT_DOWNLOAD_URL,
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
-        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.40' },
-        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.40' },
+        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.175' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.175' },
       },
     })
   })
@@ -776,37 +1483,418 @@ export function registerRmmAgentRoutes(app) {
     const auth = await requireRmmManager(c)
     if (auth.error) return auth.error
     const body = await c.req.json().catch(() => ({}))
+    const persistent = body.persistent !== false
     const ttlMinutes = boundedInteger(body.ttlMinutes ?? 60, 5, 1440) || 60
     const maxUses = boundedInteger(body.maxUses ?? 1, 1, 100) || 1
+    const selection = persistent
+      ? tenantInstallerSelection(body.installerPlatform || body.platform, body.installerFormat || body.format)
+      : null
+    if (persistent && !selection) {
+      return c.json({ error: 'Select a supported operating system and installer type.' }, 400)
+    }
     const token = secret('h5e')
-    const label = clean(body.label).slice(0, 120) || 'Hi5Central Agent deployment'
+    const label = clean(body.label).slice(0, 120) || (persistent
+      ? `${selection.platform === 'macos' ? 'macOS' : selection.platform[0].toUpperCase() + selection.platform.slice(1)} ${selection.format.toUpperCase()} Agent installer`
+      : 'One-time Agent enrollment')
     const result = await pool.query(
       `INSERT INTO rmm_agent_enrollment_packages
-         (tenant_id,label,token_hash,token_hint,expires_at,max_uses,created_by_user_id)
-       VALUES ($1,$2,$3,$4,now()+make_interval(mins=>$5),$6,$7)
-       RETURNING id,label,token_hint,expires_at,max_uses,use_count,created_at`,
-      [auth.session.tenant_id, label, sha256(token), token.slice(-6), ttlMinutes, maxUses, auth.session.user_id],
+         (tenant_id,label,token_hash,token_hint,expires_at,max_uses,created_by_user_id,persistent,installer_platform,installer_format)
+       VALUES ($1,$2,$3,$4,
+               CASE WHEN $8 THEN now()+interval '100 years' ELSE now()+make_interval(mins=>$5) END,
+               $6,$7,$8,$9,$10)
+       RETURNING id,label,token_hint,expires_at,max_uses,use_count,created_at,persistent,installer_platform,installer_format`,
+      [auth.session.tenant_id, label, sha256(token), token.slice(-6), ttlMinutes, maxUses, auth.session.user_id, persistent,
+        selection?.platform || null, selection?.format || null],
     )
     const pkg = result.rows[0]
-    const installCommand = `.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ENROLLMENT_TOKEN="${token}" /TENANT_ID="${auth.session.tenant_id}" /PACKAGE_ID="${pkg.id}" /INSTALL_SOURCE="rmm-portal"`
-    const quotedToken = shellSingleQuote(token)
-    const linuxInstallCommand = `tmp="$(mktemp -d)" && curl -fsSL ${shellSingleQuote(AGENT_DOWNLOAD_URL_LINUX)} -o "$tmp/agent.tar.gz" && tar -xzf "$tmp/agent.tar.gz" -C "$tmp" && sudo "$tmp/installer/linux/install.sh" --enrollment-token ${quotedToken}`
-    const macosInstallCommand = `tmp="$(mktemp -d)" && curl -fsSL ${shellSingleQuote(AGENT_DOWNLOAD_URL_MACOS)} -o "$tmp/agent.tar.gz" && tar -xzf "$tmp/agent.tar.gz" -C "$tmp" && sudo "$tmp/installer/macos/install.sh" --enrollment-token ${quotedToken}`
+    const externalDeploymentConfig = persistent && !['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)
+    const deploymentSecret = externalDeploymentConfig ? tenantInstallerDeploymentSecret(pkg.id) : ''
+    const deploymentConfig = externalDeploymentConfig ? {
+      schemaVersion: 1,
+      apiBase: TENANT_INSTALLER_API_BASE,
+      deploymentId: pkg.id,
+      deploymentSecret,
+      installerPlatform: pkg.installer_platform,
+      installerFormat: pkg.installer_format,
+    } : null
+
+    const installCommand = persistent
+      ? tenantInstallerInstallCommand(pkg.installer_format)
+      : `.\\Hi5CentralAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ENROLLMENT_TOKEN="${token}" /TENANT_ID="${auth.session.tenant_id}" /PACKAGE_ID="${pkg.id}" /INSTALL_SOURCE="rmm-portal"`
+
     return c.json({
       package: pkg,
-      enrollmentToken: token,
-      downloadUrl: AGENT_DOWNLOAD_URL,
+      deploymentId: persistent ? pkg.id : null,
+      enrollmentToken: persistent ? null : token,
+      deploymentConfig,
+      deploymentConfigUrl: externalDeploymentConfig
+        ? `/api/v1/rmm/agent/enrollment-packages/${pkg.id}/deployment-config`
+        : null,
+      installer: persistent ? {
+        platform: pkg.installer_platform,
+        format: pkg.installer_format,
+        url: tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format),
+        bundleUrl: tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format),
+      } : null,
+      downloadUrl: persistent
+        ? (tenantInstallerBundleUrl(pkg.id, pkg.installer_platform, pkg.installer_format) || tenantInstallerUrl(pkg.id, pkg.installer_format))
+        : AGENT_DOWNLOAD_URL,
       installCommand,
       downloads: {
         windows: { label: 'Windows x64', url: AGENT_DOWNLOAD_URL },
-        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.40' },
-        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.40' },
+        macos: { label: 'macOS universal', url: AGENT_DOWNLOAD_URL_MACOS, version: '0.3.175' },
+        linux: { label: 'Linux x64', url: AGENT_DOWNLOAD_URL_LINUX, version: '0.3.175' },
       },
-      installCommands: {
-        windows: installCommand,
-        macos: macosInstallCommand,
-        linux: linuxInstallCommand,
+    }, 201)
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/installer', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    let installer
+    let contentType
+    let downloadName
+    try {
+      if (pkg.installer_platform === 'windows' && ['exe', 'msi'].includes(pkg.installer_format)) {
+        installer = windowsTenantInstallerBuffer(packageId, pkg.installer_format)
+        contentType = pkg.installer_format === 'msi'
+          ? 'application/x-msi'
+          : 'application/vnd.microsoft.portable-executable'
+        downloadName = pkg.installer_format === 'msi'
+          ? 'Hi5CentralAgent.msi'
+          : 'Hi5CentralAgent.exe'
+      } else if (pkg.installer_platform === 'linux' && ['deb', 'rpm'].includes(pkg.installer_format)) {
+        installer = await linuxTenantInstallerPackage(pkg)
+        contentType = pkg.installer_format === 'deb'
+          ? 'application/vnd.debian.binary-package'
+          : 'application/x-rpm'
+        downloadName = pkg.installer_format === 'deb'
+          ? 'hi5centralagent.deb'
+          : 'hi5centralagent.rpm'
+      } else {
+        return c.json({ error: 'This installer record is not a supported single-file installer.' }, 409)
+      }
+    } catch (error) {
+      return c.json({ error: clean(error?.message || error) || 'Agent installer is unavailable.' }, 503)
+    }
+
+    return new Response(installer, {
+      status: 200,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': String(installer.length),
+        'Content-Disposition': 'attachment; filename="' + downloadName + '"',
+        'Cache-Control': 'private, no-store',
       },
+    })
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/bundle', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    if (pkg.installer_platform !== 'linux' || pkg.installer_format !== 'run') {
+      return c.json({ error: 'Only the legacy RUN installer uses a Linux deployment bundle.' }, 409)
+    }
+
+    let bundle
+    try {
+      bundle = await linuxTenantInstallerBundle(pkg)
+    } catch (error) {
+      return c.json({ error: clean(error?.message || error) || 'Linux deployment bundle is unavailable.' }, 503)
+    }
+    const fileName = linuxTenantInstallerBundleName(pkg.installer_format)
+    return new Response(bundle, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/gzip',
+        'Content-Length': String(bundle.length),
+        'Content-Disposition': 'attachment; filename="' + fileName + '"',
+        'Cache-Control': 'private, no-store',
+      },
+    })
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/deployment-config', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg || !pkg.persistent) return c.json({ error: 'Agent installer record not found.' }, 404)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent installer has been revoked.' }, 410)
+    if (['exe', 'msi', 'deb', 'rpm'].includes(pkg.installer_format)) {
+      return c.json({ error: 'This installer already contains its deployment configuration.' }, 409)
+    }
+
+    c.header('Content-Disposition', 'attachment; filename="Hi5CentralDeployment.json"')
+    c.header('Cache-Control', 'private, no-store')
+    return c.json({
+      schemaVersion: 1,
+      apiBase: TENANT_INSTALLER_API_BASE,
+      deploymentId: pkg.id,
+      deploymentSecret: tenantInstallerDeploymentSecret(pkg.id),
+      installerPlatform: pkg.installer_platform,
+      installerFormat: pkg.installer_format,
+    })
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/artifacts', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format,artifact_build_requested_at,
+              artifact_build_completed_at,artifact_build_error
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg) return c.json({ error: 'Agent deployment not found.' }, 404)
+    if (!pkg.persistent) return c.json({ error: 'Native artifacts are available for persistent deployments only.' }, 409)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent deployment has been revoked.' }, 410)
+
+    const artifacts = tenantInstallerArtifactRows(packageId, pkg.installer_format)
+    const readyCount = artifacts.filter((artifact) => artifact.ready).length
+    return c.json({
+      deploymentId: packageId,
+      installerPlatform: pkg.installer_platform || null,
+      installerFormat: pkg.installer_format || null,
+      status: readyCount === artifacts.length ? 'ready' : (readyCount ? 'partial' : 'building'),
+      readyCount,
+      totalCount: artifacts.length,
+      artifacts,
+      buildRequestedAt: pkg.artifact_build_requested_at,
+      buildCompletedAt: pkg.artifact_build_completed_at,
+      buildError: pkg.artifact_build_error || null,
+    })
+  })
+
+  app.post('/api/v1/rmm/agent/enrollment-packages/:packageId/build-artifacts', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    return c.json({
+      error: 'Per-tenant installer builds are retired. Hi5Central now uses shared release installers with a tenant deployment JSON.',
+    }, 410)
+  })
+
+  app.get('/api/v1/rmm/agent/enrollment-packages/:packageId/artifacts/:format', async (c) => {
+    const auth = await requireRmmManager(c)
+    if (auth.error) return auth.error
+    const packageId = clean(c.req.param('packageId'))
+    const format = clean(c.req.param('format')).toLowerCase()
+    const definition = TENANT_INSTALLER_ASSETS[format]
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+    if (!definition) return c.json({ error: 'Unsupported installer format.' }, 404)
+
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1 AND tenant_id=$2
+        LIMIT 1`,
+      [packageId, auth.session.tenant_id],
+    )
+    const pkg = result.rows[0]
+    if (!pkg) return c.json({ error: 'Agent deployment not found.' }, 404)
+    if (!pkg.persistent) return c.json({ error: 'Native artifacts are available for persistent deployments only.' }, 409)
+    if (pkg.revoked_at) return c.json({ error: 'This Agent deployment has been revoked.' }, 410)
+    if (pkg.installer_format && pkg.installer_format !== format) {
+      return c.json({ error: 'This installer record is for ' + pkg.installer_format.toUpperCase() + '.' }, 404)
+    }
+
+    const artifactPath = tenantInstallerArtifactPath(packageId, format)
+    if (!artifactPath || !existsSync(artifactPath)) {
+      return c.json({ error: format.toUpperCase() + ' installer is still building.' }, 409)
+    }
+
+    let stats
+    try {
+      stats = statSync(artifactPath)
+    } catch {
+      return c.json({ error: format.toUpperCase() + ' installer is unavailable.' }, 503)
+    }
+    if (!stats.isFile() || stats.size <= 0) {
+      return c.json({ error: format.toUpperCase() + ' installer is unavailable.' }, 503)
+    }
+
+    return new Response(Readable.toWeb(createReadStream(artifactPath)), {
+      status: 200,
+      headers: {
+        'Content-Type': definition.contentType,
+        'Content-Length': String(stats.size),
+        'Content-Disposition': 'attachment; filename="' + definition.downloadName(packageId) + '"',
+        'Cache-Control': 'private, no-store',
+      },
+    })
+  })
+
+  app.get('/api/v1/agent/installer-builds/:packageId/bootstrap', async (c) => {
+    const builder = await verifyTenantInstallerBuilder(c)
+    if (!builder) return c.json({ error: 'Trusted tenant installer builder authentication failed.' }, 401)
+
+    const packageId = clean(c.req.param('packageId'))
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+    const result = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1
+        LIMIT 1`,
+      [packageId],
+    )
+    const pkg = result.rows[0]
+    if (!pkg) return c.json({ error: 'Agent deployment not found.' }, 404)
+    if (!pkg.persistent) return c.json({ error: 'Agent deployment is not persistent.' }, 409)
+    if (pkg.revoked_at) return c.json({ error: 'Agent deployment has been revoked.' }, 410)
+
+    return c.json({
+      deploymentId: packageId,
+      deploymentSecret: tenantInstallerDeploymentSecret(packageId),
+      installerPlatform: pkg.installer_platform || null,
+      installerFormat: pkg.installer_format || null,
+      apiBase: TENANT_INSTALLER_API_BASE,
+    })
+  })
+
+  app.put('/api/v1/agent/installer-builds/:packageId/artifacts/:format', async (c) => {
+    const builder = await verifyTenantInstallerBuilder(c)
+    if (!builder) return c.json({ error: 'Trusted tenant installer builder authentication failed.' }, 401)
+
+    const packageId = clean(c.req.param('packageId'))
+    const format = clean(c.req.param('format')).toLowerCase()
+    const definition = TENANT_INSTALLER_ASSETS[format]
+    if (!isUuid(packageId)) return c.json({ error: 'A valid deployment ID is required.' }, 400)
+    if (!definition) return c.json({ error: 'Unsupported installer format.' }, 404)
+
+    const packageResult = await pool.query(
+      `SELECT id,persistent,revoked_at,installer_platform,installer_format
+         FROM rmm_agent_enrollment_packages
+        WHERE id=$1
+        LIMIT 1`,
+      [packageId],
+    )
+    const pkg = packageResult.rows[0]
+    if (!pkg) return c.json({ error: 'Agent deployment not found.' }, 404)
+    if (!pkg.persistent) return c.json({ error: 'Agent deployment is not persistent.' }, 409)
+    if (pkg.revoked_at) return c.json({ error: 'Agent deployment has been revoked.' }, 410)
+    if (pkg.installer_format && pkg.installer_format !== format) {
+      return c.json({ error: 'Unexpected installer format for this build.' }, 409)
+    }
+    if (pkg.installer_platform && definition.platform !== pkg.installer_platform) {
+      return c.json({ error: 'Unexpected installer platform for this build.' }, 409)
+    }
+
+    const declaredLength = Number(c.req.header('content-length') || 0)
+    if (declaredLength > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+      return c.json({ error: 'Installer artifact exceeds the upload size limit.' }, 413)
+    }
+
+    const body = c.req.raw.body
+    if (!body) return c.json({ error: 'Installer artifact is empty.' }, 400)
+
+    const directory = tenantInstallerDirectory(packageId)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const artifactPath = tenantInstallerArtifactPath(packageId, format)
+    const tempPath = artifactPath + '.' + randomUUID() + '.tmp'
+    const hash = createHash('sha256')
+    let sizeBytes = 0
+
+    try {
+      const limiter = new Transform({
+        transform(chunk, encoding, callback) {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+          sizeBytes += bytes.length
+          if (sizeBytes > TENANT_INSTALLER_MAX_ARTIFACT_BYTES) {
+            callback(new Error('artifact_too_large'))
+            return
+          }
+          hash.update(bytes)
+          callback(null, bytes)
+        },
+      })
+
+      await pipeline(
+        Readable.fromWeb(body),
+        limiter,
+        createWriteStream(tempPath, { flags: 'wx', mode: 0o600 }),
+      )
+    } catch (error) {
+      try { unlinkSync(tempPath) } catch {}
+      if (clean(error?.message) === 'artifact_too_large') {
+        return c.json({ error: 'Installer artifact exceeds the upload size limit.' }, 413)
+      }
+      console.error('Tenant installer artifact upload failed', packageId, format, error)
+      return c.json({ error: 'Installer artifact upload failed.' }, 500)
+    }
+
+    if (!sizeBytes) {
+      try { unlinkSync(tempPath) } catch {}
+      return c.json({ error: 'Installer artifact is empty.' }, 400)
+    }
+
+    const expectedSha256 = clean(c.req.header('x-hi5-sha256')).toLowerCase()
+    const actualSha256 = hash.digest('hex')
+    if (expectedSha256 && expectedSha256 !== actualSha256) {
+      try { unlinkSync(tempPath) } catch {}
+      return c.json({ error: 'Installer artifact SHA-256 did not match the upload header.' }, 400)
+    }
+
+    renameSync(tempPath, artifactPath)
+
+    const artifacts = tenantInstallerArtifactRows(packageId, pkg.installer_format)
+    const readyCount = artifacts.filter((artifact) => artifact.ready).length
+    await pool.query(
+      `UPDATE rmm_agent_enrollment_packages
+          SET artifact_build_completed_at=CASE WHEN $2 THEN now() ELSE artifact_build_completed_at END,
+              artifact_build_error=NULL,updated_at=now()
+        WHERE id=$1`,
+      [packageId, readyCount === artifacts.length],
+    )
+
+    return c.json({
+      success: true,
+      format,
+      sha256: actualSha256,
+      sizeBytes,
+      readyCount,
+      totalCount: artifacts.length,
     }, 201)
   })
 
@@ -1089,10 +2177,85 @@ export function registerRmmAgentRoutes(app) {
     }, 202)
   })
 
+  app.post('/api/v1/agent/deployments/:deploymentId/enrollment-token', async (c) => {
+    const deploymentId = clean(c.req.param('deploymentId'))
+    if (!isUuid(deploymentId)) {
+      return c.json({ success: false, error: 'A valid deployment ID is required.' }, 400)
+    }
+
+    const body = await c.req.json().catch(() => ({}))
+    const deploymentSecret = clean(body.deploymentSecret || body.deployment_secret)
+    if (!deploymentSecret || deploymentSecret.length > 200) {
+      return c.json({ success: false, error: 'A valid deployment secret is required.' }, 400)
+    }
+
+    const issued = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT id,tenant_id,persistent,revoked_at
+           FROM rmm_agent_enrollment_packages
+          WHERE id=$1
+          FOR UPDATE`,
+        [deploymentId],
+      )
+      const deployment = result.rows[0]
+      if (!deployment || !deployment.persistent) {
+        return { error: 'Agent deployment is invalid.', status: 401 }
+      }
+      if (deployment.revoked_at) {
+        return { error: 'Agent deployment has been revoked.', status: 410 }
+      }
+
+      const expectedSecret = tenantInstallerDeploymentSecret(deployment.id)
+      if (!constantTimeTextEqual(deploymentSecret, expectedSecret)) {
+        return { error: 'Agent deployment credentials are invalid.', status: 401 }
+      }
+
+      const token = secret('h5e')
+      const child = await client.query(
+        `INSERT INTO rmm_agent_enrollment_packages
+           (tenant_id,label,token_hash,token_hint,expires_at,max_uses,
+            created_by_user_id,persistent,parent_deployment_id)
+         VALUES ($1,'Tenant installer bootstrap',$2,$3,now()+interval '10 minutes',
+                 1,NULL,false,$4)
+         RETURNING id,expires_at`,
+        [deployment.tenant_id, sha256(token), token.slice(-6), deployment.id],
+      )
+
+      return {
+        token,
+        tenantId: deployment.tenant_id,
+        packageId: child.rows[0].id,
+        expiresAt: child.rows[0].expires_at,
+      }
+    })
+
+    if (issued.error) {
+      return c.json({ success: false, error: issued.error }, issued.status || 400)
+    }
+
+    c.header('Cache-Control', 'no-store')
+    const accept = clean(c.req.header('accept')).toLowerCase()
+    if (accept.includes('text/plain')) return c.text(issued.token, 201)
+    return c.json({
+      success: true,
+      enrollmentToken: issued.token,
+      tenantId: issued.tenantId,
+      packageId: issued.packageId,
+      expiresAt: issued.expiresAt,
+    }, 201)
+  })
+
   app.post('/api/v1/agent/enroll', async (c) => {
     const body = await c.req.json().catch(() => ({}))
     const enrollmentToken = clean(body.enrollmentToken || body.enrollment_token)
-    if (!enrollmentToken || enrollmentToken.length > 200) return c.json({ success: false, error: 'A valid enrollment token is required.' }, 400)
+    const deploymentId = clean(body.deploymentId || body.deployment_id)
+    const deploymentSecret = clean(body.deploymentSecret || body.deployment_secret)
+    if (enrollmentToken.length > 200) return c.json({ success: false, error: 'Enrollment token is too long.' }, 400)
+    if (deploymentSecret.length > 200) return c.json({ success: false, error: 'Deployment secret is too long.' }, 400)
+    if (deploymentId && !isUuid(deploymentId)) return c.json({ success: false, error: 'A valid deployment ID is required.' }, 400)
+    if (!enrollmentToken && !deploymentId) {
+      return c.json({ success: false, error: 'An enrollment token or persistent deployment ID is required.' }, 400)
+    }
     const platform = canonicalAgentPlatform(clean(body.platform).slice(0, 50) || 'windows')
     const hostname = clean(body.hostname).slice(0, 255) || (platform + ' device')
     const architecture = clean(body.architecture).slice(0, 50)
@@ -1102,17 +2265,32 @@ export function registerRmmAgentRoutes(app) {
 
     const enrolled = await withTransaction(async (client) => {
       const packageResult = await client.query(
-        `SELECT id,tenant_id,max_uses,use_count,expires_at,revoked_at
-           FROM rmm_agent_enrollment_packages
-          WHERE token_hash=$1
-          FOR UPDATE`,
-        [tokenHash],
+        `SELECT p.id,p.tenant_id,p.max_uses,p.use_count,p.expires_at,p.revoked_at,
+                p.persistent,p.parent_deployment_id,parent.revoked_at AS parent_revoked_at
+           FROM rmm_agent_enrollment_packages p
+           LEFT JOIN rmm_agent_enrollment_packages parent ON parent.id=p.parent_deployment_id
+          WHERE (p.token_hash=$1 AND NULLIF($2,'') IS NULL)
+             OR (p.id=NULLIF($2,'')::uuid AND p.persistent=true)
+          FOR UPDATE OF p`,
+        [tokenHash, deploymentId],
       )
       const pkg = packageResult.rows[0]
-      if (!pkg) return { error: 'Enrollment token is invalid.', status: 401 }
-      if (pkg.revoked_at) return { error: 'Enrollment token has been revoked.', status: 410 }
-      if (new Date(pkg.expires_at).getTime() <= Date.now()) return { error: 'Enrollment token has expired.', status: 410 }
-      if (Number(pkg.use_count) >= Number(pkg.max_uses)) return { error: 'Enrollment token has already been used.', status: 410 }
+      if (!pkg) return { error: deploymentId ? 'Agent deployment is invalid.' : 'Enrollment token is invalid.', status: 401 }
+      if (pkg.revoked_at || pkg.parent_revoked_at) {
+        return { error: pkg.persistent || pkg.parent_deployment_id ? 'Agent deployment has been revoked.' : 'Enrollment token has been revoked.', status: 410 }
+      }
+      if (pkg.persistent) {
+        const expectedSecret = tenantInstallerDeploymentSecret(pkg.id)
+        if (!deploymentSecret || !constantTimeTextEqual(deploymentSecret, expectedSecret)) {
+          return { error: 'Agent deployment credentials are invalid.', status: 401 }
+        }
+      }
+      if (!pkg.persistent && new Date(pkg.expires_at).getTime() <= Date.now()) {
+        return { error: 'Enrollment token has expired.', status: 410 }
+      }
+      if (!pkg.persistent && Number(pkg.use_count) >= Number(pkg.max_uses)) {
+        return { error: 'Enrollment token has already been used.', status: 410 }
+      }
       const deviceId = randomUUID()
       const deviceKey = secret('h5d')
       const reference = `RMM-${deviceId.slice(0, 8).toUpperCase()}`
@@ -1182,10 +2360,8 @@ export function registerRmmAgentRoutes(app) {
     if (!agent) return c.json({ success: false, error: 'Agent authentication failed.' }, 401)
     const body = await c.req.json().catch(() => ({}))
     if (!body || typeof body !== 'object') return c.json({ success: false, error: 'Inventory payload is required.' }, 400)
-    if (clean(body.device_id) && clean(body.device_id) !== String(agent.id)) {
-      return c.json({ success: false, error: 'Inventory device identity does not match authentication.' }, 409)
-    }
-    await ingestInventory(agent, body)
+    if (clean(body.device_id) && clean(body.device_id) !== String(agent.id)) {      return c.json({ success: false, error: 'Inventory device identity does not match authentication.' }, 409)
+    }    await ingestInventory(agent, body)
     return c.json({ success: true })
   })
 
